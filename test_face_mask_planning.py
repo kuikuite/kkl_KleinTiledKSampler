@@ -26,7 +26,7 @@ def load_sampler_class():
     spec = importlib.util.spec_from_file_location("sampler", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.SZ_KleinTiledKSampler
+    return module.SZ_KleinFaceMaskTiledKSampler
 
 
 class FaceMaskPlanningTest(unittest.TestCase):

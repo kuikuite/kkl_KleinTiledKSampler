@@ -22,7 +22,7 @@ import comfy.utils
 import latent_preview
 
 
-class SZ_KleinTiledKSampler:
+class SZ_KleinFaceMaskTiledKSampler:
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -441,9 +441,9 @@ class SZ_KleinTiledKSampler:
         face_positions = self._sort_tiles_by_content(face_positions, blend_up) if face_positions else []
         total_tiles    = len(tile_positions) + len(face_positions)
         if face_positions:
-            print(f"[SZ_KleinTiledKSampler] 普通区域 {len(tile_positions)} 个 tile，人脸区域 {len(face_positions)} 个 tile")
+            print(f"[SZ_KleinFaceMaskTiledKSampler] 普通区域 {len(tile_positions)} 个 tile，人脸区域 {len(face_positions)} 个 tile")
         else:
-            print(f"[SZ_KleinTiledKSampler] 共 {len(tile_positions)} 个 tile")
+            print(f"[SZ_KleinFaceMaskTiledKSampler] 共 {len(tile_positions)} 个 tile")
 
         # ── 分块对应采样（两两并行） ──────────────────────────────────────
         result     = torch.zeros((B, C, H, W), device=device)
@@ -485,9 +485,9 @@ class SZ_KleinTiledKSampler:
 
 # ──────────────────────────────────────────────────────────────────────────────
 NODE_CLASS_MAPPINGS = {
-    "SZ_KleinTiledKSampler": SZ_KleinTiledKSampler,
+    "SZ_KleinFaceMaskTiledKSampler": SZ_KleinFaceMaskTiledKSampler,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "SZ_KleinTiledKSampler": "SZ KleinTiled KSampler",
+    "SZ_KleinFaceMaskTiledKSampler": "SZ KleinTiled KSampler (Face Mask)",
 }
