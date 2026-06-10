@@ -7,11 +7,13 @@ SZ KleinTiled KSampler
 核心功能：
   1. 外部接入 latent_blend 作为全局引导
   2. 生成空间连续的全局噪声图
-  3. 分块对应采样（相同尺寸的 tile 两两并行，加速约40-50%）
+  3. 支持 face_mask：人脸和非人脸区域分别规划 tile
   4. overlap 羽化混合写回
   5. 自动对齐原始图像的色彩统计量，防止饱和度漂移
-  6. 可选 face_mask：人脸区域单独规划更细 tile，再与非人脸区域按同样羽化逻辑合并
+  6. VAE encode/decode 节点复用同一套人脸/非人脸分区规则
 """
+
+import math
 
 import torch
 import torch.nn.functional as F
@@ -22,7 +24,406 @@ import comfy.utils
 import latent_preview
 
 
-class SZ_KleinFaceMaskTiledKSampler:
+class SZ_KleinRegionPlanner:
+    KLEIN_MAX_IMAGE_SIZE = 2048
+    IMAGE_ALIGNMENT = 16
+    LATENT_DOWNSCALE = 8
+    LATENT_ALIGNMENT = IMAGE_ALIGNMENT // LATENT_DOWNSCALE
+
+    def _align_image_size(self, value, minimum=64, maximum=None):
+        maximum = self.KLEIN_MAX_IMAGE_SIZE if maximum is None else maximum
+        value = int(round(value))
+        value = max(minimum, min(maximum, value))
+        value = (value // self.IMAGE_ALIGNMENT) * self.IMAGE_ALIGNMENT
+        return max(minimum, value)
+
+    def _align_image_overlap(self, value, maximum=None):
+        maximum = self.KLEIN_MAX_IMAGE_SIZE if maximum is None else maximum
+        value = int(round(value))
+        value = max(0, min(maximum, value))
+        return (value // self.IMAGE_ALIGNMENT) * self.IMAGE_ALIGNMENT
+
+    def _image_to_latent_tile(self, image_px):
+        return max(1, self._align_image_size(image_px) // self.LATENT_DOWNSCALE)
+
+    def _image_to_latent_overlap(self, image_px):
+        return max(0, self._align_image_overlap(image_px) // self.LATENT_DOWNSCALE)
+
+    def _align_down(self, value, unit):
+        if unit <= 1:
+            return int(value)
+        return int(value) // unit * unit
+
+    def _align_up(self, value, unit):
+        if unit <= 1:
+            return int(value)
+        return int(math.ceil(float(value) / float(unit)) * unit)
+
+    def _expand_region_to_min_size(self, start, end, limit, target, align_unit):
+        target = min(limit, target)
+        if end - start >= target:
+            return start, end
+
+        deficit = target - (end - start)
+        start = max(0, start - deficit // 2)
+        end = min(limit, end + deficit - deficit // 2)
+        if end - start < target:
+            if start == 0:
+                end = min(limit, target)
+            elif end == limit:
+                start = max(0, limit - target)
+
+        start = self._align_down(start, align_unit)
+        end = self._align_up(end, align_unit)
+        if end > limit:
+            end = limit
+            start = max(0, self._align_down(end - target, align_unit))
+        if end - start < target:
+            end = min(limit, start + target)
+        return start, end
+
+    def _anchored_tile_start(self, start, end, limit, tile, align_unit):
+        if tile >= limit:
+            return 0
+        center = (start + end - tile) / 2.0
+        candidates = [
+            self._align_down(center, align_unit),
+            self._align_up(center, align_unit),
+            self._align_down(start, align_unit),
+            self._align_up(end - tile, align_unit),
+            0,
+            limit - tile,
+        ]
+        valid = []
+        for candidate in candidates:
+            candidate = max(0, min(int(candidate), limit - tile))
+            if candidate <= start and candidate + tile >= end:
+                valid.append(candidate)
+        if valid:
+            return min(valid, key=lambda value: abs(value - center))
+        return max(0, min(self._align_down(center, align_unit), limit - tile))
+
+    def _get_tile_positions(self, H, W, tile_h, tile_w, overlap):
+        tile_h = min(max(1, int(tile_h)), H)
+        tile_w = min(max(1, int(tile_w)), W)
+        overlap = max(0, int(overlap))
+        if tile_h >= H and tile_w >= W:
+            return [(0, 0, H, W)]
+        stride_h = max(1, tile_h - overlap)
+        stride_w = max(1, tile_w - overlap)
+        positions = []
+        seen = set()
+        y = 0
+        while True:
+            y0 = min(y, H - tile_h)
+            x = 0
+            while True:
+                x0 = min(x, W - tile_w)
+                key = (y0, x0)
+                if key not in seen:
+                    seen.add(key)
+                    positions.append((y0, x0, tile_h, tile_w))
+                if x0 + tile_w >= W:
+                    break
+                x += stride_w
+            if y0 + tile_h >= H:
+                break
+            y += stride_h
+        return positions
+
+    def _make_tile_record(self, kind, y0, x0, h, w, source_region=None):
+        y0 = int(y0)
+        x0 = int(x0)
+        h = int(h)
+        w = int(w)
+        return {
+            "kind": kind,
+            "image_rect": (y0, x0, h, w),
+            "latent_rect": (
+                y0 // self.LATENT_DOWNSCALE,
+                x0 // self.LATENT_DOWNSCALE,
+                max(1, h // self.LATENT_DOWNSCALE),
+                max(1, w // self.LATENT_DOWNSCALE),
+            ),
+            "source_region": source_region,
+        }
+
+    def _tile_rect_region_minimal(self, y0, y1, x0, x1, tile_h, tile_w,
+                                  overlap, source_region):
+        region_h = max(0, int(y1) - int(y0))
+        region_w = max(0, int(x1) - int(x0))
+        if region_h <= 0 or region_w <= 0:
+            return []
+        if region_h <= tile_h and region_w <= tile_w:
+            return [
+                self._make_tile_record(
+                    "background", y0, x0, region_h, region_w, source_region
+                )
+            ]
+
+        return [
+            self._make_tile_record(
+                "background", y0 + local_y, x0 + local_x, th, tw, source_region
+            )
+            for local_y, local_x, th, tw in self._get_tile_positions(
+                region_h, region_w, tile_h, tile_w, overlap
+            )
+        ]
+
+    def _split_background_around_face_region(self, face_region, image_h, image_w,
+                                             tile_h, tile_w, overlap):
+        y0, y1, x0, x1 = face_region
+        pieces = []
+        pieces.extend(
+            self._tile_rect_region_minimal(
+                0, y0, 0, image_w, tile_h, tile_w, overlap, "top"
+            )
+        )
+        pieces.extend(
+            self._tile_rect_region_minimal(
+                y1, image_h, 0, image_w, tile_h, tile_w, overlap, "bottom"
+            )
+        )
+        pieces.extend(
+            self._tile_rect_region_minimal(
+                y0, y1, 0, x0, tile_h, tile_w, overlap, "left"
+            )
+        )
+        pieces.extend(
+            self._tile_rect_region_minimal(
+                y0, y1, x1, image_w, tile_h, tile_w, overlap, "right"
+            )
+        )
+        return pieces
+
+    def _face_region_from_bbox(self, bbox, image_h, image_w, face_tile_h,
+                               face_tile_w, padding, align_unit):
+        if bbox is None:
+            return None
+        orig_y_min, orig_y_max, orig_x_min, orig_x_max = bbox
+        if orig_y_max <= orig_y_min or orig_x_max <= orig_x_min:
+            return None
+
+        box_h = max(1, orig_y_max - orig_y_min)
+        box_w = max(1, orig_x_max - orig_x_min)
+        pad_h = int(round((max(1.0, padding) - 1.0) * box_h / 2.0))
+        pad_w = int(round((max(1.0, padding) - 1.0) * box_w / 2.0))
+
+        y_min = max(0, self._align_down(orig_y_min - pad_h, align_unit))
+        y_max = min(image_h, self._align_up(orig_y_max + pad_h, align_unit))
+        x_min = max(0, self._align_down(orig_x_min - pad_w, align_unit))
+        x_max = min(image_w, self._align_up(orig_x_max + pad_w, align_unit))
+
+        y_min, y_max = self._expand_region_to_min_size(
+            y_min, y_max, image_h, min(face_tile_h, image_h), align_unit
+        )
+        x_min, x_max = self._expand_region_to_min_size(
+            x_min, x_max, image_w, min(face_tile_w, image_w), align_unit
+        )
+        return (y_min, y_max, x_min, x_max)
+
+    def _regular_tile_plan(self, image_h, image_w, tile_h, tile_w, overlap):
+        return [
+            self._make_tile_record("background", y0, x0, th, tw, "full")
+            for y0, x0, th, tw in self._get_tile_positions(
+                image_h, image_w, tile_h, tile_w, overlap
+            )
+        ]
+
+    def _plan_face_aware_tiles_from_bbox(self, bbox, image_h, image_w, tile_h,
+                                         tile_w, overlap, face_tile_h,
+                                         face_tile_w, face_overlap,
+                                         face_padding, align_unit=None):
+        image_h = int(image_h)
+        image_w = int(image_w)
+        tile_h = min(self._align_image_size(tile_h), image_h)
+        tile_w = min(self._align_image_size(tile_w), image_w)
+        overlap = self._align_image_overlap(overlap)
+        face_tile_h = min(self._align_image_size(face_tile_h), image_h)
+        face_tile_w = min(self._align_image_size(face_tile_w), image_w)
+        face_overlap = self._align_image_overlap(face_overlap)
+        align_unit = self.IMAGE_ALIGNMENT if align_unit is None else max(1, align_unit)
+
+        face_region = self._face_region_from_bbox(
+            bbox, image_h, image_w, face_tile_h, face_tile_w,
+            face_padding, align_unit
+        )
+        if face_region is None:
+            return self._regular_tile_plan(image_h, image_w, tile_h, tile_w, overlap)
+
+        background_tiles = self._split_background_around_face_region(
+            face_region, image_h, image_w, tile_h, tile_w, overlap
+        )
+        y0, y1, x0, x1 = face_region
+        face_tiles = [
+            self._make_tile_record("face", y0 + local_y, x0 + local_x, th, tw, "face")
+            for local_y, local_x, th, tw in self._get_tile_positions(
+                y1 - y0, x1 - x0, face_tile_h, face_tile_w, face_overlap
+            )
+        ]
+        return background_tiles + face_tiles
+
+    def _plan_face_aware_tiles_from_mask(self, face_mask, image_h, image_w,
+                                         tile_h, tile_w, overlap, face_tile_h,
+                                         face_tile_w, face_overlap,
+                                         face_padding, threshold=0.2,
+                                         mask_space="image"):
+        bbox = self._bbox_from_mask(face_mask, threshold)
+        if bbox is not None and mask_space == "latent":
+            bbox = tuple(int(value) * self.LATENT_DOWNSCALE for value in bbox)
+        return self._plan_face_aware_tiles_from_bbox(
+            bbox, image_h, image_w, tile_h, tile_w, overlap,
+            face_tile_h, face_tile_w, face_overlap, face_padding,
+        )
+
+    def _bbox_from_mask(self, mask, threshold):
+        if mask is None:
+            return None
+        if mask.dim() == 4:
+            mask = mask[:, 0]
+        if mask.dim() == 3:
+            mask = mask.max(dim=0).values
+        active = mask > threshold
+        if not bool(active.any()):
+            return None
+
+        ys, xs = active.nonzero(as_tuple=True)
+        return (
+            int(ys.min().item()),
+            int(ys.max().item()) + 1,
+            int(xs.min().item()),
+            int(xs.max().item()) + 1,
+        )
+
+    def _get_face_tile_positions_from_bbox(self, bbox, H, W, tile_h, tile_w,
+                                           overlap, padding, align_unit=None):
+        if bbox is None:
+            return []
+        align_unit = self.LATENT_ALIGNMENT if align_unit is None else max(1, align_unit)
+        orig_y_min, orig_y_max, orig_x_min, orig_x_max = bbox
+        if orig_y_max <= orig_y_min or orig_x_max <= orig_x_min:
+            return []
+
+        box_h = max(1, orig_y_max - orig_y_min)
+        box_w = max(1, orig_x_max - orig_x_min)
+        pad_h = int(round((max(1.0, padding) - 1.0) * box_h / 2.0))
+        pad_w = int(round((max(1.0, padding) - 1.0) * box_w / 2.0))
+
+        y_min = max(0, self._align_down(orig_y_min - pad_h, align_unit))
+        y_max = min(H, self._align_up(orig_y_max + pad_h, align_unit))
+        x_min = max(0, self._align_down(orig_x_min - pad_w, align_unit))
+        x_max = min(W, self._align_up(orig_x_max + pad_w, align_unit))
+
+        y_min, y_max = self._expand_region_to_min_size(
+            y_min, y_max, H, min(tile_h, H), align_unit
+        )
+        x_min, x_max = self._expand_region_to_min_size(
+            x_min, x_max, W, min(tile_w, W), align_unit
+        )
+
+        region_h = max(1, y_max - y_min)
+        region_w = max(1, x_max - x_min)
+        local_tiles = self._get_tile_positions(region_h, region_w, tile_h, tile_w, overlap)
+        positions = []
+
+        if box_h <= tile_h and box_w <= tile_w:
+            anchor_y = self._anchored_tile_start(
+                orig_y_min, orig_y_max, H, min(tile_h, H), align_unit
+            )
+            anchor_x = self._anchored_tile_start(
+                orig_x_min, orig_x_max, W, min(tile_w, W), align_unit
+            )
+            positions.append((anchor_y, anchor_x, min(tile_h, H), min(tile_w, W)))
+
+        positions.extend((y_min + y0, x_min + x0, th, tw)
+                         for (y0, x0, th, tw) in local_tiles)
+        deduped = []
+        seen = set()
+        for tile in positions:
+            key = (tile[0], tile[1], tile[2], tile[3])
+            if key not in seen:
+                seen.add(key)
+                deduped.append(tile)
+        return deduped
+
+    def _get_face_tile_positions(self, face_mask, H, W, tile_h, tile_w, overlap,
+                                 padding, threshold=0.2, align_unit=None):
+        if face_mask is None:
+            return []
+        bbox = self._bbox_from_mask(face_mask, threshold)
+        return self._get_face_tile_positions_from_bbox(
+            bbox, H, W, tile_h, tile_w, overlap, padding, align_unit
+        )
+
+    def _prepare_face_mask(self, face_mask, H, W, B, device):
+        """把 ComfyUI MASK 统一成当前空间的 (B,1,H,W) 软 mask。"""
+        if face_mask is None:
+            return None
+        mask = face_mask.to(device=device, dtype=torch.float32)
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0).unsqueeze(0)
+        elif mask.dim() == 3:
+            mask = mask.unsqueeze(1)
+        elif mask.dim() == 4:
+            if mask.shape[1] != 1:
+                mask = mask[:, :1]
+        else:
+            return None
+        if mask.shape[0] != B:
+            mask = mask[:1].expand(B, -1, -1, -1).clone()
+        if mask.shape[2] != H or mask.shape[3] != W:
+            mask = F.interpolate(mask, size=(H, W), mode="bilinear", align_corners=False)
+        return mask.clamp(0.0, 1.0)
+
+    def _soften_mask_units(self, mask, grow, blur, threshold):
+        if mask is None:
+            return None
+        mask = (mask > threshold).to(dtype=mask.dtype)
+        grow = max(0, int(grow))
+        blur = max(0, int(blur))
+        if grow > 0:
+            kernel = grow * 2 + 1
+            mask = F.max_pool2d(mask, kernel_size=kernel, stride=1, padding=grow)
+        if blur > 0:
+            kernel = blur * 2 + 1
+            mask = F.pad(mask, (blur, blur, blur, blur), mode="replicate")
+            mask = F.avg_pool2d(mask, kernel_size=kernel, stride=1)
+        return mask.clamp(0.0, 1.0)
+
+    def _soften_face_mask(self, face_mask, grow_px, blur_px, threshold=0.2):
+        grow = int(round(grow_px / self.LATENT_DOWNSCALE))
+        blur = int(round(blur_px / self.LATENT_DOWNSCALE))
+        return self._soften_mask_units(face_mask, grow, blur, threshold)
+
+    def _soften_image_mask(self, face_mask, grow_px, blur_px, threshold=0.2):
+        return self._soften_mask_units(face_mask, grow_px, blur_px, threshold)
+
+    def _resize_to_latent_size(self, tensor, H, W):
+        if tensor.shape[2] == H and tensor.shape[3] == W:
+            return tensor
+        return F.interpolate(tensor, size=(H, W), mode="bilinear", align_corners=False)
+
+    def _make_weight_mask(self, h, w, device):
+        wy = torch.arange(h, dtype=torch.float32, device=device)
+        wy = (torch.min(wy, h - 1 - wy) + 1.0)
+        wx = torch.arange(w, dtype=torch.float32, device=device)
+        wx = (torch.min(wx, w - 1 - wx) + 1.0)
+        weight = (wy.unsqueeze(1) * wx.unsqueeze(0))
+        weight = weight / weight.max()
+        return weight.unsqueeze(0).unsqueeze(0)
+
+    def _make_image_weight_mask(self, h, w, device):
+        return self._make_weight_mask(h, w, device).movedim(1, -1)
+
+    def _validate_image_multiple_of_16(self, H, W):
+        if H % self.IMAGE_ALIGNMENT != 0 or W % self.IMAGE_ALIGNMENT != 0:
+            raise ValueError(
+                "Klein face-region nodes require image dimensions to be multiples "
+                "of 16. Resize or pad the image before this node."
+            )
+
+
+class SZ_KleinTiledKSampler(SZ_KleinRegionPlanner):
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -48,28 +449,34 @@ class SZ_KleinFaceMaskTiledKSampler:
                     "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01
                 }),
                 "tile_width": ("INT", {
-                    "default": 512, "min": 64, "max": 2048, "step": 8
+                    "default": 2048, "min": 64, "max": 2048, "step": 16
                 }),
                 "tile_height": ("INT", {
-                    "default": 512, "min": 64, "max": 2048, "step": 8
+                    "default": 2048, "min": 64, "max": 2048, "step": 16
                 }),
                 "overlap": ("INT", {
-                    "default": 128, "min": 0, "max": 512, "step": 8
+                    "default": 128, "min": 0, "max": 1024, "step": 16
                 }),
                 "face_tile_width": ("INT", {
-                    "default": 384, "min": 64, "max": 2048, "step": 8
+                    "default": 768, "min": 64, "max": 2048, "step": 16
                 }),
                 "face_tile_height": ("INT", {
-                    "default": 384, "min": 64, "max": 2048, "step": 8
+                    "default": 768, "min": 64, "max": 2048, "step": 16
                 }),
                 "face_overlap": ("INT", {
-                    "default": 192, "min": 0, "max": 1024, "step": 8
+                    "default": 192, "min": 0, "max": 1024, "step": 16
                 }),
                 "face_padding": ("FLOAT", {
                     "default": 1.35, "min": 1.0, "max": 3.0, "step": 0.05
                 }),
                 "face_mask_threshold": ("FLOAT", {
                     "default": 0.2, "min": 0.0, "max": 1.0, "step": 0.01
+                }),
+                "face_mask_grow": ("INT", {
+                    "default": 0, "min": 0, "max": 256, "step": 16
+                }),
+                "face_mask_blur": ("INT", {
+                    "default": 24, "min": 0, "max": 256, "step": 16
                 }),
                 "blend_strength": ("FLOAT", {
                     "default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05
@@ -79,7 +486,7 @@ class SZ_KleinFaceMaskTiledKSampler:
                 }),
             },
             "optional": {
-                "face_mask":     ("MASK",),
+                "face_mask": ("MASK",),
             },
         }
 
@@ -87,35 +494,6 @@ class SZ_KleinFaceMaskTiledKSampler:
     RETURN_NAMES  = ("latent",)
     FUNCTION      = "sample"
     CATEGORY      = "SZ"
-
-    # ──────────────────────────────────────────────────────────────────────
-
-    def _get_tile_positions(self, H, W, tile_h, tile_w, overlap):
-        tile_h = min(tile_h, H)
-        tile_w = min(tile_w, W)
-        if tile_h >= H and tile_w >= W:
-            return [(0, 0, H, W)]
-        stride_h = max(1, tile_h - overlap)
-        stride_w = max(1, tile_w - overlap)
-        positions = []
-        seen = set()
-        y = 0
-        while True:
-            y0 = min(y, H - tile_h)
-            x = 0
-            while True:
-                x0 = min(x, W - tile_w)
-                key = (y0, x0)
-                if key not in seen:
-                    seen.add(key)
-                    positions.append((y0, x0, tile_h, tile_w))
-                if x0 + tile_w >= W:
-                    break
-                x += stride_w
-            if y0 + tile_h >= H:
-                break
-            y += stride_h
-        return positions
 
     def _sort_tiles_by_content(self, tile_positions, blend_up):
         """按 latent_blend 内容丰富度排序，内容多的 tile 优先处理。"""
@@ -168,128 +546,6 @@ class SZ_KleinFaceMaskTiledKSampler:
             merged.append([cp1[0], cond_dict])
         return merged
 
-    def _make_weight_mask(self, h, w, device):
-        wy = torch.arange(h, dtype=torch.float32, device=device)
-        wy = (torch.min(wy, h - 1 - wy) + 1.0)
-        wx = torch.arange(w, dtype=torch.float32, device=device)
-        wx = (torch.min(wx, w - 1 - wx) + 1.0)
-        weight = (wy.unsqueeze(1) * wx.unsqueeze(0))
-        weight = weight / weight.max()
-        return weight.unsqueeze(0).unsqueeze(0)
-
-    def _prepare_face_mask(self, face_mask, H, W, B, device):
-        """把 ComfyUI MASK 统一成 latent 空间的 (B,1,H,W) 软 mask。"""
-        if face_mask is None:
-            return None
-        mask = face_mask.to(device=device, dtype=torch.float32)
-        if mask.dim() == 2:
-            mask = mask.unsqueeze(0).unsqueeze(0)
-        elif mask.dim() == 3:
-            mask = mask.unsqueeze(1)
-        elif mask.dim() == 4:
-            if mask.shape[1] != 1:
-                mask = mask[:, :1]
-        else:
-            return None
-        if mask.shape[0] != B:
-            mask = mask[:1].expand(B, -1, -1, -1).clone()
-        if mask.shape[2] != H or mask.shape[3] != W:
-            mask = F.interpolate(mask, size=(H, W), mode="bilinear", align_corners=False)
-        return mask.clamp(0.0, 1.0)
-
-    def _get_face_tile_positions(self, face_mask, H, W, tile_h, tile_w, overlap,
-                                 padding, threshold=0.2):
-        """根据 face_mask 的有效区域生成一组人脸 tile，内部仍使用贴边去重的分块逻辑。"""
-        if face_mask is None:
-            return []
-        mask = face_mask
-        if mask.dim() == 4:
-            mask = mask[:, 0]
-        if mask.dim() == 3:
-            mask = mask.max(dim=0).values
-        active = mask > threshold
-        if not bool(active.any()):
-            return []
-
-        ys, xs = active.nonzero(as_tuple=True)
-        y_min = int(ys.min().item())
-        y_max = int(ys.max().item()) + 1
-        x_min = int(xs.min().item())
-        x_max = int(xs.max().item()) + 1
-        box_h = max(1, y_max - y_min)
-        box_w = max(1, x_max - x_min)
-        pad_h = int(round((padding - 1.0) * box_h / 2.0))
-        pad_w = int(round((padding - 1.0) * box_w / 2.0))
-        y_min = max(0, y_min - pad_h)
-        y_max = min(H, y_max + pad_h)
-        x_min = max(0, x_min - pad_w)
-        x_max = min(W, x_max + pad_w)
-
-        region_h = y_max - y_min
-        region_w = x_max - x_min
-        local_tiles = self._get_tile_positions(region_h, region_w, tile_h, tile_w, overlap)
-        return [(y_min + y0, x_min + x0, th, tw) for (y0, x0, th, tw) in local_tiles]
-
-    def _accumulate_tile(self, result, weight_map, tile_result, y0, x0, th, tw,
-                         weight, region_mask=None):
-        if region_mask is not None:
-            weight = weight * region_mask[:, :, y0:y0+th, x0:x0+tw]
-        result[:, :, y0:y0+th, x0:x0+tw] += tile_result * weight
-        weight_map[:, :, y0:y0+th, x0:x0+tw] += weight
-
-    def _process_and_accumulate_tiles(self, model, positive, negative, samples,
-                                      global_noise, blend_up, tile_positions,
-                                      result, weight_map, region_mask,
-                                      B, blend_strength,
-                                      steps, cfg, sampler_name, scheduler,
-                                      denoise, seed, previewer, device,
-                                      outer_pbar, progress_offset=0):
-        idx = 0
-        total_tiles = len(tile_positions)
-        while idx < total_tiles:
-            y0a, x0a, tha, twa = tile_positions[idx]
-
-            if idx + 1 < total_tiles:
-                y0b, x0b, thb, twb = tile_positions[idx + 1]
-                same_size = (tha == thb and twa == twb)
-            else:
-                same_size = False
-
-            if same_size and B == 1:
-                result_a, result_b = self._process_tile_pair(
-                    model, positive, negative, samples,
-                    global_noise, blend_up,
-                    y0a, x0a, tha, twa,
-                    y0b, x0b, thb, twb,
-                    B, blend_strength,
-                    steps, cfg, sampler_name, scheduler, denoise, seed,
-                    previewer, device
-                )
-                weight_a = self._make_weight_mask(tha, twa, device)
-                weight_b = self._make_weight_mask(thb, twb, device)
-                self._accumulate_tile(result, weight_map, result_a, y0a, x0a, tha, twa,
-                                      weight_a, region_mask)
-                self._accumulate_tile(result, weight_map, result_b, y0b, x0b, thb, twb,
-                                      weight_b, region_mask)
-                outer_pbar.update_absolute(progress_offset + idx + 2,
-                                           progress_offset + total_tiles, None)
-                idx += 2
-            else:
-                tile_result = self._process_tile(
-                    model, positive, negative, samples,
-                    global_noise, blend_up,
-                    y0a, x0a, tha, twa, B,
-                    blend_strength,
-                    steps, cfg, sampler_name, scheduler, denoise, seed,
-                    previewer, device
-                )
-                weight = self._make_weight_mask(tha, twa, device)
-                self._accumulate_tile(result, weight_map, tile_result, y0a, x0a, tha, twa,
-                                      weight, region_mask)
-                outer_pbar.update_absolute(progress_offset + idx + 1,
-                                           progress_offset + total_tiles, None)
-                idx += 1
-
     def _make_callback(self, pbar, previewer, total_steps):
         def callback(step, x0, x, total):
             preview_bytes = None
@@ -327,8 +583,8 @@ class SZ_KleinFaceMaskTiledKSampler:
             m, tile_noise, steps, cfg, sampler_name, scheduler,
             tile_positive, tile_negative, tile_ref,
             denoise=denoise, seed=seed, callback=tile_callback,
-        )
-        return tile_result.to(device)
+        ).to(device)
+        return self._resize_to_latent_size(tile_result, th, tw)
 
     def _process_tile_pair(self, m, positive, negative, samples,
                            global_noise, blend_up,
@@ -368,8 +624,74 @@ class SZ_KleinFaceMaskTiledKSampler:
             tile_positive, tile_negative, tile_ref,
             denoise=denoise, seed=seed, callback=tile_callback,
         ).to(device)
+        pair_result = self._resize_to_latent_size(pair_result, tha, twa)
 
         return pair_result[:B], pair_result[B:]
+
+    def _accumulate_tile(self, result, weight_map, tile_result, y0, x0, th, tw,
+                         weight, region_mask=None):
+        if region_mask is not None:
+            mask = region_mask[:, :, y0:y0+th, x0:x0+tw]
+            if mask.shape[2] != weight.shape[2] or mask.shape[3] != weight.shape[3]:
+                mask = F.interpolate(mask, size=weight.shape[2:],
+                                     mode="bilinear", align_corners=False)
+            weight = weight * mask.to(device=weight.device, dtype=weight.dtype)
+        result[:, :, y0:y0+th, x0:x0+tw] += tile_result * weight
+        weight_map[:, :, y0:y0+th, x0:x0+tw] += weight
+
+    def _process_and_accumulate_tiles(self, model, positive, negative, samples,
+                                      global_noise, blend_up, tile_positions,
+                                      result, weight_map, region_mask,
+                                      B, blend_strength,
+                                      steps, cfg, sampler_name, scheduler,
+                                      denoise, seed, previewer, device,
+                                      outer_pbar, total_progress,
+                                      progress_offset=0):
+        idx = 0
+        total_tiles = len(tile_positions)
+        while idx < total_tiles:
+            y0a, x0a, tha, twa = tile_positions[idx]
+
+            if idx + 1 < total_tiles:
+                y0b, x0b, thb, twb = tile_positions[idx + 1]
+                same_size = (tha == thb and twa == twb)
+            else:
+                same_size = False
+
+            if same_size and B == 1:
+                result_a, result_b = self._process_tile_pair(
+                    model, positive, negative, samples,
+                    global_noise, blend_up,
+                    y0a, x0a, tha, twa,
+                    y0b, x0b, thb, twb,
+                    B, blend_strength,
+                    steps, cfg, sampler_name, scheduler, denoise, seed,
+                    previewer, device
+                )
+                weight_a = self._make_weight_mask(tha, twa, device)
+                weight_b = self._make_weight_mask(thb, twb, device)
+                self._accumulate_tile(result, weight_map, result_a, y0a, x0a, tha, twa,
+                                      weight_a, region_mask)
+                self._accumulate_tile(result, weight_map, result_b, y0b, x0b, thb, twb,
+                                      weight_b, region_mask)
+                outer_pbar.update_absolute(progress_offset + idx + 2,
+                                           total_progress, None)
+                idx += 2
+            else:
+                tile_result = self._process_tile(
+                    model, positive, negative, samples,
+                    global_noise, blend_up,
+                    y0a, x0a, tha, twa, B,
+                    blend_strength,
+                    steps, cfg, sampler_name, scheduler, denoise, seed,
+                    previewer, device
+                )
+                weight = self._make_weight_mask(tha, twa, device)
+                self._accumulate_tile(result, weight_map, tile_result, y0a, x0a, tha, twa,
+                                      weight, region_mask)
+                outer_pbar.update_absolute(progress_offset + idx + 1,
+                                           total_progress, None)
+                idx += 1
 
     def _match_color_stats(self, result, original, strength):
         """
@@ -391,26 +713,18 @@ class SZ_KleinFaceMaskTiledKSampler:
                 matched[:, c] = result[:, c] * (1.0 - strength) + adjusted * strength
         return matched
 
-    # ──────────────────────────────────────────────────────────────────────
-
     def sample(self, model, positive, negative, latent_image, latent_blend,
                seed, steps, cfg, sampler_name, scheduler, denoise,
                tile_width, tile_height, overlap,
                face_tile_width, face_tile_height, face_overlap,
                face_padding, face_mask_threshold,
+               face_mask_grow, face_mask_blur,
                blend_strength, color_preserve,
                face_mask=None):
 
         device  = comfy.model_management.get_torch_device()
         samples = latent_image["samples"].clone().to(device)
         B, C, H, W = samples.shape
-
-        tile_h = max(1, tile_height // 8)
-        tile_w = max(1, tile_width  // 8)
-        ovlp   = max(1, overlap     // 8)
-        face_tile_h = max(1, face_tile_height // 8)
-        face_tile_w = max(1, face_tile_width  // 8)
-        face_ovlp   = max(1, face_overlap     // 8)
 
         previewer = latent_preview.get_previewer(device, model.model.latent_format)
 
@@ -430,48 +744,66 @@ class SZ_KleinFaceMaskTiledKSampler:
         gen.manual_seed(seed)
         global_noise = torch.randn((B, C, H, W), generator=gen).to(device)
 
-        # ── 规划 tile，按内容排序 ─────────────────────────────────────────
         face_mask_up = self._prepare_face_mask(face_mask, H, W, B, device)
-        tile_positions = self._get_tile_positions(H, W, tile_h, tile_w, ovlp)
-        tile_positions = self._sort_tiles_by_content(tile_positions, blend_up)
-        face_positions = self._get_face_tile_positions(
-            face_mask_up, H, W, face_tile_h, face_tile_w, face_ovlp,
-            face_padding, face_mask_threshold
+        face_mask_soft = self._soften_face_mask(
+            face_mask_up, face_mask_grow, face_mask_blur, face_mask_threshold
         )
-        face_positions = self._sort_tiles_by_content(face_positions, blend_up) if face_positions else []
-        total_tiles    = len(tile_positions) + len(face_positions)
+        tile_plan = self._plan_face_aware_tiles_from_mask(
+            face_mask_up,
+            H * self.LATENT_DOWNSCALE,
+            W * self.LATENT_DOWNSCALE,
+            tile_height,
+            tile_width,
+            overlap,
+            face_tile_height,
+            face_tile_width,
+            face_overlap,
+            face_padding,
+            face_mask_threshold,
+            mask_space="latent",
+        )
+        background_positions = [
+            tile["latent_rect"] for tile in tile_plan if tile["kind"] == "background"
+        ]
+        face_positions = [
+            tile["latent_rect"] for tile in tile_plan if tile["kind"] == "face"
+        ]
+        background_positions = self._sort_tiles_by_content(background_positions, blend_up)
         if face_positions:
-            print(f"[SZ_KleinFaceMaskTiledKSampler] 普通区域 {len(tile_positions)} 个 tile，人脸区域 {len(face_positions)} 个 tile")
+            face_positions = self._sort_tiles_by_content(face_positions, blend_up)
+            print(
+                f"[SZ_KleinTiledKSampler] 非人脸区域 {len(background_positions)} 个 tile，"
+                f"人脸区域 {len(face_positions)} 个 tile"
+            )
         else:
-            print(f"[SZ_KleinFaceMaskTiledKSampler] 共 {len(tile_positions)} 个 tile")
+            print(f"[SZ_KleinTiledKSampler] 共 {len(background_positions)} 个 tile")
 
-        # ── 分块对应采样（两两并行） ──────────────────────────────────────
         result     = torch.zeros((B, C, H, W), device=device)
         weight_map = torch.zeros((B, 1, H, W), device=device)
+        total_tiles = len(background_positions) + len(face_positions)
         outer_pbar = comfy.utils.ProgressBar(total_tiles)
 
-        if face_positions and face_mask_up is not None:
-            non_face_mask = (1.0 - face_mask_up).clamp(0.0, 1.0)
-        else:
-            non_face_mask = None
+        non_face_mask = None
+        if face_positions and face_mask_soft is not None:
+            non_face_mask = (1.0 - face_mask_soft).clamp(0.0, 1.0)
 
         self._process_and_accumulate_tiles(
             model, positive, negative, samples,
-            global_noise, blend_up, tile_positions,
+            global_noise, blend_up, background_positions,
             result, weight_map, non_face_mask,
             B, blend_strength,
             steps, cfg, sampler_name, scheduler, denoise, seed,
-            previewer, device, outer_pbar, 0
+            previewer, device, outer_pbar, total_tiles, 0
         )
 
-        if face_positions and face_mask_up is not None:
+        if face_positions and face_mask_soft is not None:
             self._process_and_accumulate_tiles(
                 model, positive, negative, samples,
                 global_noise, blend_up, face_positions,
-                result, weight_map, face_mask_up,
+                result, weight_map, face_mask_soft,
                 B, blend_strength,
                 steps, cfg, sampler_name, scheduler, denoise, seed,
-                previewer, device, outer_pbar, len(tile_positions)
+                previewer, device, outer_pbar, total_tiles, len(background_positions)
             )
 
         result = result / weight_map.clamp(min=1e-8)
@@ -483,11 +815,271 @@ class SZ_KleinFaceMaskTiledKSampler:
         return ({"samples": result.cpu()},)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+class SZ_KleinFaceRegionVAEEncode(SZ_KleinRegionPlanner):
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pixels": ("IMAGE",),
+                "vae": ("VAE",),
+                "tile_size": ("INT", {
+                    "default": 2048, "min": 64, "max": 2048, "step": 16
+                }),
+                "overlap": ("INT", {
+                    "default": 128, "min": 0, "max": 1024, "step": 16
+                }),
+                "face_tile_size": ("INT", {
+                    "default": 768, "min": 64, "max": 2048, "step": 16
+                }),
+                "face_overlap": ("INT", {
+                    "default": 192, "min": 0, "max": 1024, "step": 16
+                }),
+                "face_padding": ("FLOAT", {
+                    "default": 1.35, "min": 1.0, "max": 3.0, "step": 0.05
+                }),
+                "face_mask_threshold": ("FLOAT", {
+                    "default": 0.2, "min": 0.0, "max": 1.0, "step": 0.01
+                }),
+                "face_mask_grow": ("INT", {
+                    "default": 0, "min": 0, "max": 256, "step": 16
+                }),
+                "face_mask_blur": ("INT", {
+                    "default": 24, "min": 0, "max": 256, "step": 16
+                }),
+            },
+            "optional": {
+                "face_mask": ("MASK",),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("latent",)
+    FUNCTION = "encode"
+    CATEGORY = "SZ"
+
+    def _accumulate_encoded_tile(self, vae, pixels, y0, x0, th, tw,
+                                 result_state, region_mask, device):
+        latent = vae.encode(pixels[:, y0:y0+th, x0:x0+tw, :]).to(device)
+        B, C, lh, lw = latent.shape
+        ly0 = y0 // self.LATENT_DOWNSCALE
+        lx0 = x0 // self.LATENT_DOWNSCALE
+
+        result, weight_map = result_state
+        if result is None:
+            full_h = pixels.shape[1] // self.LATENT_DOWNSCALE
+            full_w = pixels.shape[2] // self.LATENT_DOWNSCALE
+            result = torch.zeros((B, C, full_h, full_w), device=device)
+            weight_map = torch.zeros((B, 1, full_h, full_w), device=device)
+
+        weight = self._make_weight_mask(lh, lw, device)
+        if region_mask is not None:
+            mask = region_mask[:, :, y0:y0+th, x0:x0+tw]
+            mask = F.interpolate(mask, size=(lh, lw), mode="bilinear", align_corners=False)
+            weight = weight * mask.to(device=device, dtype=weight.dtype)
+
+        result[:, :, ly0:ly0+lh, lx0:lx0+lw] += latent * weight
+        weight_map[:, :, ly0:ly0+lh, lx0:lx0+lw] += weight
+        return result, weight_map
+
+    def encode(self, pixels, vae, tile_size, overlap, face_tile_size,
+               face_overlap, face_padding, face_mask_threshold,
+               face_mask_grow, face_mask_blur, face_mask=None):
+        device = comfy.model_management.get_torch_device()
+        pixels = pixels.to(device)
+        B, H, W, C = pixels.shape
+        self._validate_image_multiple_of_16(H, W)
+
+        face_mask_up = self._prepare_face_mask(face_mask, H, W, B, device)
+        face_mask_soft = self._soften_image_mask(
+            face_mask_up, face_mask_grow, face_mask_blur, face_mask_threshold
+        )
+        tile_plan = self._plan_face_aware_tiles_from_mask(
+            face_mask_up,
+            H,
+            W,
+            tile_size,
+            tile_size,
+            overlap,
+            face_tile_size,
+            face_tile_size,
+            face_overlap,
+            face_padding,
+            face_mask_threshold,
+        )
+        background_tiles = [
+            tile["image_rect"] for tile in tile_plan if tile["kind"] == "background"
+        ]
+        face_tiles = [
+            tile["image_rect"] for tile in tile_plan if tile["kind"] == "face"
+        ]
+
+        result_state = (None, None)
+        non_face_mask = None
+        if face_tiles and face_mask_soft is not None:
+            non_face_mask = (1.0 - face_mask_soft).clamp(0.0, 1.0)
+
+        total_tiles = len(background_tiles) + len(face_tiles)
+        pbar = comfy.utils.ProgressBar(total_tiles)
+        done = 0
+        for y0, x0, th, tw in background_tiles:
+            result_state = self._accumulate_encoded_tile(
+                vae, pixels, y0, x0, th, tw, result_state, non_face_mask, device
+            )
+            done += 1
+            pbar.update_absolute(done, total_tiles, None)
+
+        for y0, x0, th, tw in face_tiles:
+            result_state = self._accumulate_encoded_tile(
+                vae, pixels, y0, x0, th, tw, result_state, face_mask_soft, device
+            )
+            done += 1
+            pbar.update_absolute(done, total_tiles, None)
+
+        result, weight_map = result_state
+        if result is None:
+            result = vae.encode(pixels).to(device)
+        else:
+            result = result / weight_map.clamp(min=1e-8)
+        return ({"samples": result.cpu()},)
+
+
+class SZ_KleinFaceRegionVAEDecode(SZ_KleinRegionPlanner):
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "samples": ("LATENT",),
+                "vae": ("VAE",),
+                "tile_size": ("INT", {
+                    "default": 2048, "min": 64, "max": 2048, "step": 16
+                }),
+                "overlap": ("INT", {
+                    "default": 128, "min": 0, "max": 1024, "step": 16
+                }),
+                "face_tile_size": ("INT", {
+                    "default": 768, "min": 64, "max": 2048, "step": 16
+                }),
+                "face_overlap": ("INT", {
+                    "default": 192, "min": 0, "max": 1024, "step": 16
+                }),
+                "face_padding": ("FLOAT", {
+                    "default": 1.35, "min": 1.0, "max": 3.0, "step": 0.05
+                }),
+                "face_mask_threshold": ("FLOAT", {
+                    "default": 0.2, "min": 0.0, "max": 1.0, "step": 0.01
+                }),
+                "face_mask_grow": ("INT", {
+                    "default": 0, "min": 0, "max": 256, "step": 16
+                }),
+                "face_mask_blur": ("INT", {
+                    "default": 24, "min": 0, "max": 256, "step": 16
+                }),
+            },
+            "optional": {
+                "face_mask": ("MASK",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "decode"
+    CATEGORY = "SZ"
+
+    def _accumulate_decoded_tile(self, vae, samples, y0, x0, th, tw,
+                                 result_state, region_mask, device):
+        image = vae.decode(samples[:, :, y0:y0+th, x0:x0+tw]).to(device)
+        B, ih, iw, C = image.shape
+        iy0 = y0 * self.LATENT_DOWNSCALE
+        ix0 = x0 * self.LATENT_DOWNSCALE
+
+        result, weight_map = result_state
+        if result is None:
+            full_h = samples.shape[2] * self.LATENT_DOWNSCALE
+            full_w = samples.shape[3] * self.LATENT_DOWNSCALE
+            result = torch.zeros((B, full_h, full_w, C), device=device)
+            weight_map = torch.zeros((B, full_h, full_w, 1), device=device)
+
+        weight = self._make_image_weight_mask(ih, iw, device)
+        if region_mask is not None:
+            mask = region_mask[:, :, y0:y0+th, x0:x0+tw]
+            mask = F.interpolate(mask, size=(ih, iw), mode="bilinear", align_corners=False)
+            mask = mask.movedim(1, -1)
+            weight = weight * mask.to(device=device, dtype=weight.dtype)
+
+        result[:, iy0:iy0+ih, ix0:ix0+iw, :] += image * weight
+        weight_map[:, iy0:iy0+ih, ix0:ix0+iw, :] += weight
+        return result, weight_map
+
+    def decode(self, samples, vae, tile_size, overlap, face_tile_size,
+               face_overlap, face_padding, face_mask_threshold,
+               face_mask_grow, face_mask_blur, face_mask=None):
+        device = comfy.model_management.get_torch_device()
+        latent = samples["samples"].to(device)
+        B, C, H, W = latent.shape
+
+        face_mask_up = self._prepare_face_mask(face_mask, H, W, B, device)
+        face_mask_soft = self._soften_face_mask(
+            face_mask_up, face_mask_grow, face_mask_blur, face_mask_threshold
+        )
+        tile_plan = self._plan_face_aware_tiles_from_mask(
+            face_mask_up,
+            H * self.LATENT_DOWNSCALE,
+            W * self.LATENT_DOWNSCALE,
+            tile_size,
+            tile_size,
+            overlap,
+            face_tile_size,
+            face_tile_size,
+            face_overlap,
+            face_padding,
+            face_mask_threshold,
+            mask_space="latent",
+        )
+        background_tiles = [
+            tile["latent_rect"] for tile in tile_plan if tile["kind"] == "background"
+        ]
+        face_tiles = [
+            tile["latent_rect"] for tile in tile_plan if tile["kind"] == "face"
+        ]
+
+        result_state = (None, None)
+        non_face_mask = None
+        if face_tiles and face_mask_soft is not None:
+            non_face_mask = (1.0 - face_mask_soft).clamp(0.0, 1.0)
+
+        total_tiles = len(background_tiles) + len(face_tiles)
+        pbar = comfy.utils.ProgressBar(total_tiles)
+        done = 0
+        for y0, x0, th, tw in background_tiles:
+            result_state = self._accumulate_decoded_tile(
+                vae, latent, y0, x0, th, tw, result_state, non_face_mask, device
+            )
+            done += 1
+            pbar.update_absolute(done, total_tiles, None)
+
+        for y0, x0, th, tw in face_tiles:
+            result_state = self._accumulate_decoded_tile(
+                vae, latent, y0, x0, th, tw, result_state, face_mask_soft, device
+            )
+            done += 1
+            pbar.update_absolute(done, total_tiles, None)
+
+        result, weight_map = result_state
+        if result is None:
+            result = vae.decode(latent).to(device)
+        else:
+            result = result / weight_map.clamp(min=1e-8)
+        return (result.cpu(),)
+
+
 NODE_CLASS_MAPPINGS = {
-    "SZ_KleinFaceMaskTiledKSampler": SZ_KleinFaceMaskTiledKSampler,
+    "SZ_KleinTiledKSampler": SZ_KleinTiledKSampler,
+    "SZ_KleinFaceRegionVAEEncode": SZ_KleinFaceRegionVAEEncode,
+    "SZ_KleinFaceRegionVAEDecode": SZ_KleinFaceRegionVAEDecode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "SZ_KleinFaceMaskTiledKSampler": "SZ KleinTiled KSampler (Face Mask)",
+    "SZ_KleinTiledKSampler": "SZ KleinTiled KSampler",
+    "SZ_KleinFaceRegionVAEEncode": "SZ Klein Face Region VAE Encode",
+    "SZ_KleinFaceRegionVAEDecode": "SZ Klein Face Region VAE Decode",
 }
