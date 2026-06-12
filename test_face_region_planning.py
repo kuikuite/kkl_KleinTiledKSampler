@@ -131,6 +131,31 @@ class FaceRegionPlanningTest(unittest.TestCase):
         self.assertEqual(background_tiles[0]["image_rect"], (0, 0, 1024, 1280))
         self.assertEqual(background_tiles[0]["latent_rect"], (0, 0, 64, 80))
 
+    def test_small_face_mask_does_not_expand_to_full_image_when_face_tile_is_large(self):
+        plan = self.sampler._plan_face_aware_tiles_from_bbox(
+            bbox=(184, 240, 224, 280),
+            image_h=512,
+            image_w=512,
+            tile_h=512,
+            tile_w=512,
+            overlap=128,
+            face_tile_h=768,
+            face_tile_w=768,
+            face_overlap=192,
+            face_padding=1.35,
+            latent_downscale=16,
+        )
+
+        face_tiles = [tile for tile in plan if tile["kind"] == "face"]
+        self.assertEqual(len(face_tiles), 1)
+        self.assertLessEqual(face_tiles[0]["image_rect"][2], 112)
+        self.assertLessEqual(face_tiles[0]["image_rect"][3], 112)
+        y0, x0, h, w = face_tiles[0]["image_rect"]
+        self.assertLessEqual(y0, 184)
+        self.assertLessEqual(x0, 224)
+        self.assertGreaterEqual(y0 + h, 240)
+        self.assertGreaterEqual(x0 + w, 280)
+
     def test_background_band_that_fits_tile_stays_single_tile(self):
         plan = self.sampler._split_background_around_face_region(
             face_region=(256, 768, 256, 768),

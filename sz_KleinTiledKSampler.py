@@ -30,6 +30,7 @@ class SZ_KleinRegionPlanner:
     LATENT_DOWNSCALE = 8
     DEFAULT_VAE_DOWNSCALE = 16
     LATENT_ALIGNMENT = IMAGE_ALIGNMENT // LATENT_DOWNSCALE
+    MIN_FACE_REGION_SIZE = 64
 
     def _align_image_size(self, value, minimum=64, maximum=None):
         maximum = self.KLEIN_MAX_IMAGE_SIZE if maximum is None else maximum
@@ -264,11 +265,13 @@ class SZ_KleinRegionPlanner:
         x_min = max(0, self._align_down(orig_x_min - pad_w, align_unit))
         x_max = min(image_w, self._align_up(orig_x_max + pad_w, align_unit))
 
+        min_face_h = min(image_h, self.MIN_FACE_REGION_SIZE)
+        min_face_w = min(image_w, self.MIN_FACE_REGION_SIZE)
         y_min, y_max = self._expand_region_to_min_size(
-            y_min, y_max, image_h, min(face_tile_h, image_h), align_unit
+            y_min, y_max, image_h, min_face_h, align_unit
         )
         x_min, x_max = self._expand_region_to_min_size(
-            x_min, x_max, image_w, min(face_tile_w, image_w), align_unit
+            x_min, x_max, image_w, min_face_w, align_unit
         )
         return (y_min, y_max, x_min, x_max)
 
@@ -523,10 +526,10 @@ class SZ_KleinTiledKSampler(SZ_KleinRegionPlanner):
                     "default": 128, "min": 0, "max": 1024, "step": 16
                 }),
                 "face_tile_width": ("INT", {
-                    "default": 768, "min": 64, "max": 2048, "step": 16
+                    "default": 256, "min": 64, "max": 2048, "step": 16
                 }),
                 "face_tile_height": ("INT", {
-                    "default": 768, "min": 64, "max": 2048, "step": 16
+                    "default": 256, "min": 64, "max": 2048, "step": 16
                 }),
                 "face_overlap": ("INT", {
                     "default": 192, "min": 0, "max": 1024, "step": 16
@@ -895,7 +898,7 @@ class SZ_KleinFaceRegionVAEEncode(SZ_KleinRegionPlanner):
                     "default": 128, "min": 0, "max": 1024, "step": 16
                 }),
                 "face_tile_size": ("INT", {
-                    "default": 768, "min": 64, "max": 2048, "step": 16
+                    "default": 256, "min": 64, "max": 2048, "step": 16
                 }),
                 "face_overlap": ("INT", {
                     "default": 192, "min": 0, "max": 1024, "step": 16
@@ -1031,7 +1034,7 @@ class SZ_KleinFaceRegionVAEDecode(SZ_KleinRegionPlanner):
                     "default": 128, "min": 0, "max": 1024, "step": 16
                 }),
                 "face_tile_size": ("INT", {
-                    "default": 768, "min": 64, "max": 2048, "step": 16
+                    "default": 256, "min": 64, "max": 2048, "step": 16
                 }),
                 "face_overlap": ("INT", {
                     "default": 192, "min": 0, "max": 1024, "step": 16

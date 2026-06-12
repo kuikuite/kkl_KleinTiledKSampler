@@ -115,7 +115,11 @@ class NodeContractStaticTest(unittest.TestCase):
         encode_required = self.module.SZ_KleinFaceRegionVAEEncode.INPUT_TYPES()["required"]
         decode_required = self.module.SZ_KleinFaceRegionVAEDecode.INPUT_TYPES()["required"]
 
+        self.assertEqual(sampler_required["face_tile_width"][1]["default"], 256)
+        self.assertEqual(sampler_required["face_tile_height"][1]["default"], 256)
         for required in (sampler_required, encode_required, decode_required):
+            if "face_tile_size" in required:
+                self.assertEqual(required["face_tile_size"][1]["default"], 256)
             self.assertEqual(required["face_mask_grow"][1]["default"], 64)
             self.assertEqual(required["face_mask_blur"][1]["default"], 64)
 
