@@ -115,11 +115,11 @@ class NodeContractStaticTest(unittest.TestCase):
         encode_required = self.module.SZ_KleinFaceRegionVAEEncode.INPUT_TYPES()["required"]
         decode_required = self.module.SZ_KleinFaceRegionVAEDecode.INPUT_TYPES()["required"]
 
-        self.assertEqual(sampler_required["face_tile_width"][1]["default"], 256)
-        self.assertEqual(sampler_required["face_tile_height"][1]["default"], 256)
+        self.assertEqual(sampler_required["face_tile_width"][1]["default"], 768)
+        self.assertEqual(sampler_required["face_tile_height"][1]["default"], 768)
         for required in (sampler_required, encode_required, decode_required):
             if "face_tile_size" in required:
-                self.assertEqual(required["face_tile_size"][1]["default"], 256)
+                self.assertEqual(required["face_tile_size"][1]["default"], 768)
             self.assertEqual(required["face_mask_grow"][1]["default"], 64)
             self.assertEqual(required["face_mask_blur"][1]["default"], 64)
 
@@ -128,7 +128,7 @@ class NodeContractStaticTest(unittest.TestCase):
 
         self.assertIn("_plan_face_aware_tiles_from_mask", source)
         self.assertIn("background_positions", source)
-        self.assertIn("face_positions", source)
+        self.assertIn("face_tiles", source)
 
     def test_vae_nodes_use_shared_face_aware_tile_plan(self):
         encode_source = inspect.getsource(self.module.SZ_KleinFaceRegionVAEEncode.encode)
@@ -140,6 +140,32 @@ class NodeContractStaticTest(unittest.TestCase):
         self.assertIn("_plan_face_aware_tiles_from_mask", decode_source)
         self.assertIn("background_tiles", decode_source)
         self.assertIn("face_tiles", decode_source)
+
+    def test_face_paths_use_upscaled_processing_canvas(self):
+        sampler_source = "\n".join([
+            inspect.getsource(self.module.SZ_KleinTiledKSampler.sample),
+            inspect.getsource(self.module.SZ_KleinTiledKSampler._process_face_tile),
+            inspect.getsource(self.module.SZ_KleinTiledKSampler._process_and_accumulate_tiles),
+            inspect.getsource(self.module.SZ_KleinTiledKSampler._process_and_accumulate_face_tiles),
+        ])
+        encode_source = "\n".join([
+            inspect.getsource(self.module.SZ_KleinFaceRegionVAEEncode.encode),
+            inspect.getsource(self.module.SZ_KleinFaceRegionVAEEncode._accumulate_encoded_face_tile),
+        ])
+        decode_source = "\n".join([
+            inspect.getsource(self.module.SZ_KleinFaceRegionVAEDecode.decode),
+            inspect.getsource(self.module.SZ_KleinFaceRegionVAEDecode._accumulate_decoded_face_tile),
+        ])
+
+        self.assertIn("_process_face_tile", sampler_source)
+        self.assertIn("_process_and_accumulate_face_tiles", sampler_source)
+        self.assertIn("process_content_latent_rect", sampler_source)
+        self.assertIn("_face_conditioning_refs", sampler_source)
+        self.assertIn("_accumulate_encoded_face_tile", encode_source)
+        self.assertIn("process_content_rect", encode_source)
+        self.assertIn("_accumulate_decoded_face_tile", decode_source)
+        self.assertIn("process_latent_size", decode_source)
+        self.assertIn("process_content_rect", decode_source)
 
     def test_background_tiles_are_not_masked_out_inside_face_bbox(self):
         sampler_source = inspect.getsource(self.module.SZ_KleinTiledKSampler.sample)

@@ -192,6 +192,44 @@ class SZ_KleinRegionPlanner:
             "source_region": source_region,
         }
 
+    def _make_face_tile_record(self, y0, x0, h, w, face_tile_h, face_tile_w,
+                               latent_downscale=None):
+        record = self._make_tile_record(
+            "face", y0, x0, h, w, "face", latent_downscale
+        )
+        latent_downscale = self._normalise_latent_downscale(latent_downscale)
+        process_h = self._align_down(face_tile_h, self.IMAGE_ALIGNMENT)
+        process_w = self._align_down(face_tile_w, self.IMAGE_ALIGNMENT)
+        process_h = max(self.IMAGE_ALIGNMENT, process_h)
+        process_w = max(self.IMAGE_ALIGNMENT, process_w)
+
+        scale = min(float(process_h) / float(max(1, h)),
+                    float(process_w) / float(max(1, w)))
+        content_h = self._align_down(max(self.IMAGE_ALIGNMENT, int(round(h * scale))),
+                                     self.IMAGE_ALIGNMENT)
+        content_w = self._align_down(max(self.IMAGE_ALIGNMENT, int(round(w * scale))),
+                                     self.IMAGE_ALIGNMENT)
+        content_h = min(process_h, max(self.IMAGE_ALIGNMENT, content_h))
+        content_w = min(process_w, max(self.IMAGE_ALIGNMENT, content_w))
+        content_y = self._align_down((process_h - content_h) // 2, self.IMAGE_ALIGNMENT)
+        content_x = self._align_down((process_w - content_w) // 2, self.IMAGE_ALIGNMENT)
+
+        record.update({
+            "process_image_size": (process_h, process_w),
+            "process_content_rect": (content_y, content_x, content_h, content_w),
+            "process_latent_size": (
+                max(1, process_h // latent_downscale),
+                max(1, process_w // latent_downscale),
+            ),
+            "process_content_latent_rect": (
+                content_y // latent_downscale,
+                content_x // latent_downscale,
+                max(1, content_h // latent_downscale),
+                max(1, content_w // latent_downscale),
+            ),
+        })
+        return record
+
     def _tile_rect_region_minimal(self, y0, y1, x0, x1, tile_h, tile_w,
                                   overlap, source_region, latent_downscale=None):
         region_h = max(0, int(y1) - int(y0))
@@ -297,8 +335,8 @@ class SZ_KleinRegionPlanner:
         tile_h = min(self._align_image_size(tile_h), image_h)
         tile_w = min(self._align_image_size(tile_w), image_w)
         overlap = self._align_image_overlap(overlap)
-        face_tile_h = min(self._align_image_size(face_tile_h), image_h)
-        face_tile_w = min(self._align_image_size(face_tile_w), image_w)
+        face_tile_h = self._align_image_size(face_tile_h)
+        face_tile_w = self._align_image_size(face_tile_w)
         face_overlap = self._align_image_overlap(face_overlap)
         align_unit = self.IMAGE_ALIGNMENT if align_unit is None else max(1, align_unit)
 
@@ -316,9 +354,9 @@ class SZ_KleinRegionPlanner:
         )
         y0, y1, x0, x1 = face_region
         face_tiles = [
-            self._make_tile_record(
-                "face", y0 + local_y, x0 + local_x, th, tw, "face",
-                latent_downscale
+            self._make_face_tile_record(
+                y0 + local_y, x0 + local_x, th, tw,
+                face_tile_h, face_tile_w, latent_downscale
             )
             for local_y, local_x, th, tw in self._get_tile_positions(
                 y1 - y0, x1 - x0, face_tile_h, face_tile_w, face_overlap
@@ -471,6 +509,32 @@ class SZ_KleinRegionPlanner:
             return tensor
         return F.interpolate(tensor, size=(H, W), mode="bilinear", align_corners=False)
 
+    def _paste_resized_latent_content(self, canvas, content, content_rect):
+        cy, cx, ch, cw = content_rect
+        resized = self._resize_to_latent_size(content, ch, cw)
+        canvas[:, :, cy:cy+ch, cx:cx+cw] = resized
+        return canvas
+
+    def _extract_resized_latent_content(self, canvas, content_rect, out_h, out_w):
+        cy, cx, ch, cw = content_rect
+        content = canvas[:, :, cy:cy+ch, cx:cx+cw]
+        return self._resize_to_latent_size(content, out_h, out_w)
+
+    def _paste_resized_image_content(self, canvas, content, content_rect):
+        cy, cx, ch, cw = content_rect
+        content_nchw = content.movedim(-1, 1)
+        resized = F.interpolate(content_nchw, size=(ch, cw),
+                                mode="bilinear", align_corners=False)
+        canvas[:, cy:cy+ch, cx:cx+cw, :] = resized.movedim(1, -1)
+        return canvas
+
+    def _extract_resized_image_content(self, canvas, content_rect, out_h, out_w):
+        cy, cx, ch, cw = content_rect
+        content = canvas[:, cy:cy+ch, cx:cx+cw, :].movedim(-1, 1)
+        resized = F.interpolate(content, size=(out_h, out_w),
+                                mode="bilinear", align_corners=False)
+        return resized.movedim(1, -1)
+
     def _make_weight_mask(self, h, w, device):
         wy = torch.arange(h, dtype=torch.float32, device=device)
         wy = (torch.min(wy, h - 1 - wy) + 1.0)
@@ -526,10 +590,10 @@ class SZ_KleinTiledKSampler(SZ_KleinRegionPlanner):
                     "default": 128, "min": 0, "max": 1024, "step": 16
                 }),
                 "face_tile_width": ("INT", {
-                    "default": 256, "min": 64, "max": 2048, "step": 16
+                    "default": 768, "min": 64, "max": 2048, "step": 16
                 }),
                 "face_tile_height": ("INT", {
-                    "default": 256, "min": 64, "max": 2048, "step": 16
+                    "default": 768, "min": 64, "max": 2048, "step": 16
                 }),
                 "face_overlap": ("INT", {
                     "default": 192, "min": 0, "max": 1024, "step": 16
@@ -585,6 +649,31 @@ class SZ_KleinTiledKSampler(SZ_KleinRegionPlanner):
                 ]
             scaled_cond.append([cond_pair[0], cond_dict])
         return scaled_cond
+
+    def _face_conditioning_refs(self, conditioning, tile):
+        y0, x0, th, tw = tile["latent_rect"]
+        ph, pw = tile["process_latent_size"]
+        content_rect = tile["process_content_latent_rect"]
+        face_cond = []
+        for cond_pair in conditioning:
+            cond_dict = cond_pair[1].copy()
+            if "reference_latents" in cond_dict:
+                refs = []
+                for ref in cond_dict["reference_latents"]:
+                    canvas = torch.zeros(
+                        (ref.shape[0], ref.shape[1], ph, pw),
+                        device=ref.device,
+                        dtype=ref.dtype,
+                    )
+                    content = ref[:, :, y0:y0+th, x0:x0+tw].clone()
+                    refs.append(
+                        self._paste_resized_latent_content(
+                            canvas, content, content_rect
+                        )
+                    )
+                cond_dict["reference_latents"] = refs
+            face_cond.append([cond_pair[0], cond_dict])
+        return face_cond
 
     def _crop_conditioning_refs(self, conditioning, y0, x0, th, tw):
         """按 tile 位置裁剪 reference_latents。"""
@@ -696,6 +785,50 @@ class SZ_KleinTiledKSampler(SZ_KleinRegionPlanner):
 
         return pair_result[:B], pair_result[B:]
 
+    def _process_face_tile(self, m, positive, negative, samples,
+                           global_noise, blend_up, tile,
+                           B, blend_strength,
+                           steps, cfg, sampler_name, scheduler, denoise, seed,
+                           previewer, device):
+        y0, x0, th, tw = tile["latent_rect"]
+        ph, pw = tile["process_latent_size"]
+        content_rect = tile["process_content_latent_rect"]
+
+        tile_noise = torch.zeros((B, samples.shape[1], ph, pw), device=device)
+        face_noise = global_noise[:, :, y0:y0+th, x0:x0+tw].clone()
+        tile_noise = self._paste_resized_latent_content(
+            tile_noise, face_noise, content_rect
+        )
+
+        blend_canvas = torch.zeros_like(tile_noise)
+        face_blend = blend_up[:, :, y0:y0+th, x0:x0+tw]
+        blend_canvas = self._paste_resized_latent_content(
+            blend_canvas, face_blend, content_rect
+        )
+
+        base_weight = max(0.0, 1.0 - blend_strength)
+        tile_noise = tile_noise * base_weight + blend_canvas * blend_strength
+
+        tile_ref = torch.zeros((B, samples.shape[1], ph, pw), device=device)
+        face_ref = samples[:, :, y0:y0+th, x0:x0+tw].clone()
+        tile_ref = self._paste_resized_latent_content(
+            tile_ref, face_ref, content_rect
+        ).cpu()
+
+        tile_positive = self._face_conditioning_refs(positive, tile)
+        tile_negative = self._face_conditioning_refs(negative, tile)
+
+        inner_pbar = comfy.utils.ProgressBar(steps)
+        tile_callback = self._make_callback(inner_pbar, previewer, steps)
+
+        tile_result = comfy.sample.sample(
+            m, tile_noise, steps, cfg, sampler_name, scheduler,
+            tile_positive, tile_negative, tile_ref,
+            denoise=denoise, seed=seed, callback=tile_callback,
+        ).to(device)
+        tile_result = self._resize_to_latent_size(tile_result, ph, pw)
+        return self._extract_resized_latent_content(tile_result, content_rect, th, tw)
+
     def _accumulate_tile(self, result, weight_map, tile_result, y0, x0, th, tw,
                          weight, region_mask=None):
         if region_mask is not None:
@@ -760,6 +893,31 @@ class SZ_KleinTiledKSampler(SZ_KleinRegionPlanner):
                 outer_pbar.update_absolute(progress_offset + idx + 1,
                                            total_progress, None)
                 idx += 1
+
+    def _process_and_accumulate_face_tiles(self, model, positive, negative, samples,
+                                           global_noise, blend_up, face_tiles,
+                                           result, weight_map, region_mask,
+                                           B, blend_strength,
+                                           steps, cfg, sampler_name, scheduler,
+                                           denoise, seed, previewer, device,
+                                           outer_pbar, total_progress,
+                                           progress_offset=0):
+        for idx, tile in enumerate(face_tiles):
+            y0, x0, th, tw = tile["latent_rect"]
+            tile_result = self._process_face_tile(
+                model, positive, negative, samples,
+                global_noise, blend_up, tile,
+                B, blend_strength,
+                steps, cfg, sampler_name, scheduler, denoise, seed,
+                previewer, device
+            )
+            weight = self._make_weight_mask(th, tw, device)
+            self._accumulate_tile(
+                result, weight_map, tile_result, y0, x0, th, tw,
+                weight, region_mask
+            )
+            outer_pbar.update_absolute(progress_offset + idx + 1,
+                                       total_progress, None)
 
     def _match_color_stats(self, result, original, strength):
         """
@@ -836,22 +994,29 @@ class SZ_KleinTiledKSampler(SZ_KleinRegionPlanner):
         background_positions = [
             tile["latent_rect"] for tile in tile_plan if tile["kind"] == "background"
         ]
-        face_positions = [
-            tile["latent_rect"] for tile in tile_plan if tile["kind"] == "face"
+        face_tiles = [
+            tile for tile in tile_plan if tile["kind"] == "face"
         ]
         background_positions = self._sort_tiles_by_content(background_positions, blend_up)
-        if face_positions:
-            face_positions = self._sort_tiles_by_content(face_positions, blend_up)
+        if face_tiles:
+            face_tiles = sorted(
+                face_tiles,
+                key=lambda tile: float(
+                    blend_up[:, :, tile["latent_rect"][0]:tile["latent_rect"][0]+tile["latent_rect"][2],
+                             tile["latent_rect"][1]:tile["latent_rect"][1]+tile["latent_rect"][3]].var()
+                ),
+                reverse=True,
+            )
             print(
                 f"[SZ_KleinTiledKSampler] 非人脸区域 {len(background_positions)} 个 tile，"
-                f"人脸区域 {len(face_positions)} 个 tile"
+                f"人脸区域 {len(face_tiles)} 个 tile"
             )
         else:
             print(f"[SZ_KleinTiledKSampler] 共 {len(background_positions)} 个 tile")
 
         result     = torch.zeros((B, C, H, W), device=device)
         weight_map = torch.zeros((B, 1, H, W), device=device)
-        total_tiles = len(background_positions) + len(face_positions)
+        total_tiles = len(background_positions) + len(face_tiles)
         outer_pbar = comfy.utils.ProgressBar(total_tiles)
 
         background_region_mask = None
@@ -865,10 +1030,10 @@ class SZ_KleinTiledKSampler(SZ_KleinRegionPlanner):
             previewer, device, outer_pbar, total_tiles, 0
         )
 
-        if face_positions and face_mask_soft is not None:
-            self._process_and_accumulate_tiles(
+        if face_tiles and face_mask_soft is not None:
+            self._process_and_accumulate_face_tiles(
                 model, positive, negative, samples,
-                global_noise, blend_up, face_positions,
+                global_noise, blend_up, face_tiles,
                 result, weight_map, face_mask_soft,
                 B, blend_strength,
                 steps, cfg, sampler_name, scheduler, denoise, seed,
@@ -898,7 +1063,7 @@ class SZ_KleinFaceRegionVAEEncode(SZ_KleinRegionPlanner):
                     "default": 128, "min": 0, "max": 1024, "step": 16
                 }),
                 "face_tile_size": ("INT", {
-                    "default": 256, "min": 64, "max": 2048, "step": 16
+                    "default": 768, "min": 64, "max": 2048, "step": 16
                 }),
                 "face_overlap": ("INT", {
                     "default": 192, "min": 0, "max": 1024, "step": 16
@@ -956,6 +1121,49 @@ class SZ_KleinFaceRegionVAEEncode(SZ_KleinRegionPlanner):
         weight_map[:, :, ly0:ly0+lh, lx0:lx0+lw] += weight
         return result, weight_map
 
+    def _accumulate_encoded_face_tile(self, vae, pixels, tile,
+                                      result_state, region_mask, device,
+                                      latent_downscale):
+        y0, x0, th, tw = tile["image_rect"]
+        ph, pw = tile["process_image_size"]
+        content_rect = tile["process_content_rect"]
+
+        face_pixels = pixels[:, y0:y0+th, x0:x0+tw, :]
+        canvas = torch.zeros((pixels.shape[0], ph, pw, pixels.shape[3]),
+                             device=device, dtype=pixels.dtype)
+        canvas = self._paste_resized_image_content(canvas, face_pixels, content_rect)
+
+        latent_canvas = vae.encode(canvas).to(device)
+        B, C, lh, lw = latent_canvas.shape
+        if ph > 0 and lh > 0:
+            tile_scale_h = max(1, int(round(float(ph) / float(lh))))
+            tile_scale_w = max(1, int(round(float(pw) / float(lw))))
+            if tile_scale_h == tile_scale_w:
+                latent_downscale = tile_scale_h
+
+        ly0, lx0, lth, ltw = tile["latent_rect"]
+        latent_content_rect = tile["process_content_latent_rect"]
+        latent = self._extract_resized_latent_content(
+            latent_canvas, latent_content_rect, lth, ltw
+        )
+
+        result, weight_map = result_state
+        if result is None:
+            full_h = pixels.shape[1] // latent_downscale
+            full_w = pixels.shape[2] // latent_downscale
+            result = torch.zeros((B, C, full_h, full_w), device=device)
+            weight_map = torch.zeros((B, 1, full_h, full_w), device=device)
+
+        weight = self._make_weight_mask(lth, ltw, device)
+        if region_mask is not None:
+            mask = region_mask[:, :, y0:y0+th, x0:x0+tw]
+            mask = F.interpolate(mask, size=(lth, ltw), mode="bilinear", align_corners=False)
+            weight = weight * mask.to(device=device, dtype=weight.dtype)
+
+        result[:, :, ly0:ly0+lth, lx0:lx0+ltw] += latent * weight
+        weight_map[:, :, ly0:ly0+lth, lx0:lx0+ltw] += weight
+        return result, weight_map
+
     def encode(self, pixels, vae, tile_size, overlap, face_tile_size,
                face_overlap, face_padding, face_mask_threshold,
                face_mask_grow, face_mask_blur, face_mask=None):
@@ -987,7 +1195,7 @@ class SZ_KleinFaceRegionVAEEncode(SZ_KleinRegionPlanner):
             tile["image_rect"] for tile in tile_plan if tile["kind"] == "background"
         ]
         face_tiles = [
-            tile["image_rect"] for tile in tile_plan if tile["kind"] == "face"
+            tile for tile in tile_plan if tile["kind"] == "face"
         ]
 
         result_state = (None, None)
@@ -1004,9 +1212,9 @@ class SZ_KleinFaceRegionVAEEncode(SZ_KleinRegionPlanner):
             done += 1
             pbar.update_absolute(done, total_tiles, None)
 
-        for y0, x0, th, tw in face_tiles:
-            result_state = self._accumulate_encoded_tile(
-                vae, pixels, y0, x0, th, tw, result_state, face_mask_soft, device,
+        for tile in face_tiles:
+            result_state = self._accumulate_encoded_face_tile(
+                vae, pixels, tile, result_state, face_mask_soft, device,
                 latent_downscale
             )
             done += 1
@@ -1034,7 +1242,7 @@ class SZ_KleinFaceRegionVAEDecode(SZ_KleinRegionPlanner):
                     "default": 128, "min": 0, "max": 1024, "step": 16
                 }),
                 "face_tile_size": ("INT", {
-                    "default": 256, "min": 64, "max": 2048, "step": 16
+                    "default": 768, "min": 64, "max": 2048, "step": 16
                 }),
                 "face_overlap": ("INT", {
                     "default": 192, "min": 0, "max": 1024, "step": 16
@@ -1093,6 +1301,51 @@ class SZ_KleinFaceRegionVAEDecode(SZ_KleinRegionPlanner):
         weight_map[:, iy0:iy0+ih, ix0:ix0+iw, :] += weight
         return result, weight_map
 
+    def _accumulate_decoded_face_tile(self, vae, samples, tile,
+                                      result_state, region_mask, device,
+                                      latent_downscale):
+        y0, x0, th, tw = tile["latent_rect"]
+        ph, pw = tile["process_latent_size"]
+        content_rect = tile["process_content_latent_rect"]
+
+        canvas = torch.zeros((samples.shape[0], samples.shape[1], ph, pw),
+                             device=device, dtype=samples.dtype)
+        face_latent = samples[:, :, y0:y0+th, x0:x0+tw]
+        canvas = self._paste_resized_latent_content(canvas, face_latent, content_rect)
+
+        decoded_canvas = vae.decode(canvas).to(device)
+        B, ih, iw, C = decoded_canvas.shape
+        if ph > 0 and pw > 0:
+            tile_scale_h = max(1, int(round(float(ih) / float(ph))))
+            tile_scale_w = max(1, int(round(float(iw) / float(pw))))
+            if tile_scale_h == tile_scale_w:
+                latent_downscale = tile_scale_h
+
+        iy0, ix0, image_h, image_w = tile["image_rect"]
+        image_content_rect = tile["process_content_rect"]
+        image = self._extract_resized_image_content(
+            decoded_canvas, image_content_rect, image_h, image_w
+        )
+
+        result, weight_map = result_state
+        if result is None:
+            full_h = samples.shape[2] * latent_downscale
+            full_w = samples.shape[3] * latent_downscale
+            result = torch.zeros((B, full_h, full_w, C), device=device)
+            weight_map = torch.zeros((B, full_h, full_w, 1), device=device)
+
+        weight = self._make_image_weight_mask(image_h, image_w, device)
+        if region_mask is not None:
+            mask = region_mask[:, :, y0:y0+th, x0:x0+tw]
+            mask = F.interpolate(mask, size=(image_h, image_w),
+                                 mode="bilinear", align_corners=False)
+            mask = mask.movedim(1, -1)
+            weight = weight * mask.to(device=device, dtype=weight.dtype)
+
+        result[:, iy0:iy0+image_h, ix0:ix0+image_w, :] += image * weight
+        weight_map[:, iy0:iy0+image_h, ix0:ix0+image_w, :] += weight
+        return result, weight_map
+
     def decode(self, samples, vae, tile_size, overlap, face_tile_size,
                face_overlap, face_padding, face_mask_threshold,
                face_mask_grow, face_mask_blur, face_mask=None):
@@ -1127,7 +1380,7 @@ class SZ_KleinFaceRegionVAEDecode(SZ_KleinRegionPlanner):
             tile["latent_rect"] for tile in tile_plan if tile["kind"] == "background"
         ]
         face_tiles = [
-            tile["latent_rect"] for tile in tile_plan if tile["kind"] == "face"
+            tile for tile in tile_plan if tile["kind"] == "face"
         ]
 
         result_state = (None, None)
@@ -1144,9 +1397,9 @@ class SZ_KleinFaceRegionVAEDecode(SZ_KleinRegionPlanner):
             done += 1
             pbar.update_absolute(done, total_tiles, None)
 
-        for y0, x0, th, tw in face_tiles:
-            result_state = self._accumulate_decoded_tile(
-                vae, latent, y0, x0, th, tw, result_state, face_mask_soft, device,
+        for tile in face_tiles:
+            result_state = self._accumulate_decoded_face_tile(
+                vae, latent, tile, result_state, face_mask_soft, device,
                 latent_downscale
             )
             done += 1

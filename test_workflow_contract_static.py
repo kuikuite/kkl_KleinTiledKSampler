@@ -104,12 +104,12 @@ class WorkflowContractStaticTest(unittest.TestCase):
         for node in workflow["nodes"]:
             values = node.get("widgets_values", [])
             if node["type"] in {"SZ_KleinFaceRegionVAEEncode", "SZ_KleinFaceRegionVAEDecode"}:
-                self.assertEqual(values[2], 256)
+                self.assertEqual(values[2], 768)
                 self.assertEqual(values[6], 64)
                 self.assertEqual(values[7], 64)
             elif node["type"] == "SZ_KleinTiledKSampler":
-                self.assertEqual(values[10], 256)
-                self.assertEqual(values[11], 256)
+                self.assertEqual(values[10], 768)
+                self.assertEqual(values[11], 768)
                 self.assertEqual(values[15], 64)
                 self.assertEqual(values[16], 64)
 

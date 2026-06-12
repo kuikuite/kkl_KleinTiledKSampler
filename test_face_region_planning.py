@@ -156,6 +156,33 @@ class FaceRegionPlanningTest(unittest.TestCase):
         self.assertGreaterEqual(y0 + h, 240)
         self.assertGreaterEqual(x0 + w, 280)
 
+    def test_small_face_tile_records_upscaled_processing_canvas(self):
+        plan = self.sampler._plan_face_aware_tiles_from_bbox(
+            bbox=(184, 240, 224, 300),
+            image_h=512,
+            image_w=512,
+            tile_h=512,
+            tile_w=512,
+            overlap=128,
+            face_tile_h=768,
+            face_tile_w=768,
+            face_overlap=192,
+            face_padding=1.35,
+            latent_downscale=16,
+        )
+
+        face_tile = next(tile for tile in plan if tile["kind"] == "face")
+
+        self.assertEqual(face_tile["process_image_size"], (768, 768))
+        self.assertEqual(face_tile["process_latent_size"], (48, 48))
+        py0, px0, ph, pw = face_tile["process_content_rect"]
+        self.assertEqual(px0, 0)
+        self.assertEqual(pw, 768)
+        self.assertGreater(py0, 0)
+        self.assertLess(py0 + ph, 768)
+        self.assertEqual(ph % 16, 0)
+        self.assertEqual(pw % 16, 0)
+
     def test_background_band_that_fits_tile_stays_single_tile(self):
         plan = self.sampler._split_background_around_face_region(
             face_region=(256, 768, 256, 768),
