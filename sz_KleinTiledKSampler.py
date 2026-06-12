@@ -28,6 +28,7 @@ class SZ_KleinRegionPlanner:
     KLEIN_MAX_IMAGE_SIZE = 2048
     IMAGE_ALIGNMENT = 16
     LATENT_DOWNSCALE = 8
+    DEFAULT_VAE_DOWNSCALE = 16
     LATENT_ALIGNMENT = IMAGE_ALIGNMENT // LATENT_DOWNSCALE
 
     def _align_image_size(self, value, minimum=64, maximum=None):
@@ -131,25 +132,67 @@ class SZ_KleinRegionPlanner:
             y += stride_h
         return positions
 
-    def _make_tile_record(self, kind, y0, x0, h, w, source_region=None):
+    def _normalise_latent_downscale(self, latent_downscale=None):
+        if latent_downscale is None:
+            return self.DEFAULT_VAE_DOWNSCALE
+        if isinstance(latent_downscale, (tuple, list)):
+            latent_downscale = latent_downscale[0] if latent_downscale else None
+        try:
+            latent_downscale = int(round(float(latent_downscale)))
+        except Exception:
+            latent_downscale = self.DEFAULT_VAE_DOWNSCALE
+        return max(1, latent_downscale)
+
+    def _infer_latent_downscale_from_latent(self, latent, fallback=None):
+        if isinstance(latent, dict):
+            for key in ("downscale_ratio_spacial", "downscale_ratio", "latent_downscale"):
+                value = latent.get(key, None)
+                if value is not None:
+                    return self._normalise_latent_downscale(value)
+        return self._normalise_latent_downscale(fallback)
+
+    def _infer_latent_downscale_from_mask(self, face_mask, latent_h, latent_w,
+                                          fallback=None):
+        fallback = self._normalise_latent_downscale(fallback)
+        if face_mask is None or not hasattr(face_mask, "shape"):
+            return fallback
+        try:
+            mask_h = int(face_mask.shape[-2])
+            mask_w = int(face_mask.shape[-1])
+        except Exception:
+            return fallback
+        if latent_h <= 0 or latent_w <= 0 or mask_h <= 0 or mask_w <= 0:
+            return fallback
+        if mask_h == latent_h and mask_w == latent_w:
+            return fallback
+        if mask_h % latent_h == 0 and mask_w % latent_w == 0:
+            scale_h = mask_h // latent_h
+            scale_w = mask_w // latent_w
+            if scale_h == scale_w:
+                return self._normalise_latent_downscale(scale_h)
+        return fallback
+
+    def _make_tile_record(self, kind, y0, x0, h, w, source_region=None,
+                          latent_downscale=None):
         y0 = int(y0)
         x0 = int(x0)
         h = int(h)
         w = int(w)
+        latent_downscale = self._normalise_latent_downscale(latent_downscale)
         return {
             "kind": kind,
             "image_rect": (y0, x0, h, w),
             "latent_rect": (
-                y0 // self.LATENT_DOWNSCALE,
-                x0 // self.LATENT_DOWNSCALE,
-                max(1, h // self.LATENT_DOWNSCALE),
-                max(1, w // self.LATENT_DOWNSCALE),
+                y0 // latent_downscale,
+                x0 // latent_downscale,
+                max(1, h // latent_downscale),
+                max(1, w // latent_downscale),
             ),
             "source_region": source_region,
         }
 
     def _tile_rect_region_minimal(self, y0, y1, x0, x1, tile_h, tile_w,
-                                  overlap, source_region):
+                                  overlap, source_region, latent_downscale=None):
         region_h = max(0, int(y1) - int(y0))
         region_w = max(0, int(x1) - int(x0))
         if region_h <= 0 or region_w <= 0:
@@ -157,13 +200,15 @@ class SZ_KleinRegionPlanner:
         if region_h <= tile_h and region_w <= tile_w:
             return [
                 self._make_tile_record(
-                    "background", y0, x0, region_h, region_w, source_region
+                    "background", y0, x0, region_h, region_w, source_region,
+                    latent_downscale
                 )
             ]
 
         return [
             self._make_tile_record(
-                "background", y0 + local_y, x0 + local_x, th, tw, source_region
+                "background", y0 + local_y, x0 + local_x, th, tw, source_region,
+                latent_downscale
             )
             for local_y, local_x, th, tw in self._get_tile_positions(
                 region_h, region_w, tile_h, tile_w, overlap
@@ -171,27 +216,32 @@ class SZ_KleinRegionPlanner:
         ]
 
     def _split_background_around_face_region(self, face_region, image_h, image_w,
-                                             tile_h, tile_w, overlap):
+                                             tile_h, tile_w, overlap,
+                                             latent_downscale=None):
         y0, y1, x0, x1 = face_region
         pieces = []
         pieces.extend(
             self._tile_rect_region_minimal(
-                0, y0, 0, image_w, tile_h, tile_w, overlap, "top"
+                0, y0, 0, image_w, tile_h, tile_w, overlap, "top",
+                latent_downscale
             )
         )
         pieces.extend(
             self._tile_rect_region_minimal(
-                y1, image_h, 0, image_w, tile_h, tile_w, overlap, "bottom"
+                y1, image_h, 0, image_w, tile_h, tile_w, overlap, "bottom",
+                latent_downscale
             )
         )
         pieces.extend(
             self._tile_rect_region_minimal(
-                y0, y1, 0, x0, tile_h, tile_w, overlap, "left"
+                y0, y1, 0, x0, tile_h, tile_w, overlap, "left",
+                latent_downscale
             )
         )
         pieces.extend(
             self._tile_rect_region_minimal(
-                y0, y1, x1, image_w, tile_h, tile_w, overlap, "right"
+                y0, y1, x1, image_w, tile_h, tile_w, overlap, "right",
+                latent_downscale
             )
         )
         return pieces
@@ -222,9 +272,12 @@ class SZ_KleinRegionPlanner:
         )
         return (y_min, y_max, x_min, x_max)
 
-    def _regular_tile_plan(self, image_h, image_w, tile_h, tile_w, overlap):
+    def _regular_tile_plan(self, image_h, image_w, tile_h, tile_w, overlap,
+                           latent_downscale=None):
         return [
-            self._make_tile_record("background", y0, x0, th, tw, "full")
+            self._make_tile_record(
+                "background", y0, x0, th, tw, "full", latent_downscale
+            )
             for y0, x0, th, tw in self._get_tile_positions(
                 image_h, image_w, tile_h, tile_w, overlap
             )
@@ -233,7 +286,9 @@ class SZ_KleinRegionPlanner:
     def _plan_face_aware_tiles_from_bbox(self, bbox, image_h, image_w, tile_h,
                                          tile_w, overlap, face_tile_h,
                                          face_tile_w, face_overlap,
-                                         face_padding, align_unit=None):
+                                         face_padding, align_unit=None,
+                                         latent_downscale=None):
+        latent_downscale = self._normalise_latent_downscale(latent_downscale)
         image_h = int(image_h)
         image_w = int(image_w)
         tile_h = min(self._align_image_size(tile_h), image_h)
@@ -249,14 +304,20 @@ class SZ_KleinRegionPlanner:
             face_padding, align_unit
         )
         if face_region is None:
-            return self._regular_tile_plan(image_h, image_w, tile_h, tile_w, overlap)
+            return self._regular_tile_plan(
+                image_h, image_w, tile_h, tile_w, overlap, latent_downscale
+            )
 
         background_tiles = self._split_background_around_face_region(
-            face_region, image_h, image_w, tile_h, tile_w, overlap
+            face_region, image_h, image_w, tile_h, tile_w, overlap,
+            latent_downscale
         )
         y0, y1, x0, x1 = face_region
         face_tiles = [
-            self._make_tile_record("face", y0 + local_y, x0 + local_x, th, tw, "face")
+            self._make_tile_record(
+                "face", y0 + local_y, x0 + local_x, th, tw, "face",
+                latent_downscale
+            )
             for local_y, local_x, th, tw in self._get_tile_positions(
                 y1 - y0, x1 - x0, face_tile_h, face_tile_w, face_overlap
             )
@@ -267,13 +328,16 @@ class SZ_KleinRegionPlanner:
                                          tile_h, tile_w, overlap, face_tile_h,
                                          face_tile_w, face_overlap,
                                          face_padding, threshold=0.2,
-                                         mask_space="image"):
+                                         mask_space="image",
+                                         latent_downscale=None):
+        latent_downscale = self._normalise_latent_downscale(latent_downscale)
         bbox = self._bbox_from_mask(face_mask, threshold)
         if bbox is not None and mask_space == "latent":
-            bbox = tuple(int(value) * self.LATENT_DOWNSCALE for value in bbox)
+            bbox = tuple(int(value) * latent_downscale for value in bbox)
         return self._plan_face_aware_tiles_from_bbox(
             bbox, image_h, image_w, tile_h, tile_w, overlap,
             face_tile_h, face_tile_w, face_overlap, face_padding,
+            latent_downscale=latent_downscale,
         )
 
     def _bbox_from_mask(self, mask, threshold):
@@ -390,9 +454,11 @@ class SZ_KleinRegionPlanner:
             mask = F.avg_pool2d(mask, kernel_size=kernel, stride=1)
         return mask.clamp(0.0, 1.0)
 
-    def _soften_face_mask(self, face_mask, grow_px, blur_px, threshold=0.2):
-        grow = int(round(grow_px / self.LATENT_DOWNSCALE))
-        blur = int(round(blur_px / self.LATENT_DOWNSCALE))
+    def _soften_face_mask(self, face_mask, grow_px, blur_px, threshold=0.2,
+                          latent_downscale=None):
+        latent_downscale = self._normalise_latent_downscale(latent_downscale)
+        grow = int(round(grow_px / latent_downscale))
+        blur = int(round(blur_px / latent_downscale))
         return self._soften_mask_units(face_mask, grow, blur, threshold)
 
     def _soften_image_mask(self, face_mask, grow_px, blur_px, threshold=0.2):
@@ -725,6 +791,7 @@ class SZ_KleinTiledKSampler(SZ_KleinRegionPlanner):
         device  = comfy.model_management.get_torch_device()
         samples = latent_image["samples"].clone().to(device)
         B, C, H, W = samples.shape
+        latent_downscale = self._infer_latent_downscale_from_latent(latent_image)
 
         previewer = latent_preview.get_previewer(device, model.model.latent_format)
 
@@ -746,12 +813,13 @@ class SZ_KleinTiledKSampler(SZ_KleinRegionPlanner):
 
         face_mask_up = self._prepare_face_mask(face_mask, H, W, B, device)
         face_mask_soft = self._soften_face_mask(
-            face_mask_up, face_mask_grow, face_mask_blur, face_mask_threshold
+            face_mask_up, face_mask_grow, face_mask_blur, face_mask_threshold,
+            latent_downscale
         )
         tile_plan = self._plan_face_aware_tiles_from_mask(
             face_mask_up,
-            H * self.LATENT_DOWNSCALE,
-            W * self.LATENT_DOWNSCALE,
+            H * latent_downscale,
+            W * latent_downscale,
             tile_height,
             tile_width,
             overlap,
@@ -761,6 +829,7 @@ class SZ_KleinTiledKSampler(SZ_KleinRegionPlanner):
             face_padding,
             face_mask_threshold,
             mask_space="latent",
+            latent_downscale=latent_downscale,
         )
         background_positions = [
             tile["latent_rect"] for tile in tile_plan if tile["kind"] == "background"
@@ -858,16 +927,22 @@ class SZ_KleinFaceRegionVAEEncode(SZ_KleinRegionPlanner):
     CATEGORY = "SZ"
 
     def _accumulate_encoded_tile(self, vae, pixels, y0, x0, th, tw,
-                                 result_state, region_mask, device):
+                                 result_state, region_mask, device,
+                                 latent_downscale):
         latent = vae.encode(pixels[:, y0:y0+th, x0:x0+tw, :]).to(device)
         B, C, lh, lw = latent.shape
-        ly0 = y0 // self.LATENT_DOWNSCALE
-        lx0 = x0 // self.LATENT_DOWNSCALE
+        if lh > 0 and lw > 0:
+            tile_scale_h = max(1, int(round(float(th) / float(lh))))
+            tile_scale_w = max(1, int(round(float(tw) / float(lw))))
+            if tile_scale_h == tile_scale_w:
+                latent_downscale = tile_scale_h
+        ly0 = y0 // latent_downscale
+        lx0 = x0 // latent_downscale
 
         result, weight_map = result_state
         if result is None:
-            full_h = pixels.shape[1] // self.LATENT_DOWNSCALE
-            full_w = pixels.shape[2] // self.LATENT_DOWNSCALE
+            full_h = pixels.shape[1] // latent_downscale
+            full_w = pixels.shape[2] // latent_downscale
             result = torch.zeros((B, C, full_h, full_w), device=device)
             weight_map = torch.zeros((B, 1, full_h, full_w), device=device)
 
@@ -893,6 +968,7 @@ class SZ_KleinFaceRegionVAEEncode(SZ_KleinRegionPlanner):
         face_mask_soft = self._soften_image_mask(
             face_mask_up, face_mask_grow, face_mask_blur, face_mask_threshold
         )
+        latent_downscale = self.DEFAULT_VAE_DOWNSCALE
         tile_plan = self._plan_face_aware_tiles_from_mask(
             face_mask_up,
             H,
@@ -905,6 +981,7 @@ class SZ_KleinFaceRegionVAEEncode(SZ_KleinRegionPlanner):
             face_overlap,
             face_padding,
             face_mask_threshold,
+            latent_downscale=latent_downscale,
         )
         background_tiles = [
             tile["image_rect"] for tile in tile_plan if tile["kind"] == "background"
@@ -923,14 +1000,16 @@ class SZ_KleinFaceRegionVAEEncode(SZ_KleinRegionPlanner):
         done = 0
         for y0, x0, th, tw in background_tiles:
             result_state = self._accumulate_encoded_tile(
-                vae, pixels, y0, x0, th, tw, result_state, non_face_mask, device
+                vae, pixels, y0, x0, th, tw, result_state, non_face_mask, device,
+                latent_downscale
             )
             done += 1
             pbar.update_absolute(done, total_tiles, None)
 
         for y0, x0, th, tw in face_tiles:
             result_state = self._accumulate_encoded_tile(
-                vae, pixels, y0, x0, th, tw, result_state, face_mask_soft, device
+                vae, pixels, y0, x0, th, tw, result_state, face_mask_soft, device,
+                latent_downscale
             )
             done += 1
             pbar.update_absolute(done, total_tiles, None)
@@ -986,16 +1065,22 @@ class SZ_KleinFaceRegionVAEDecode(SZ_KleinRegionPlanner):
     CATEGORY = "SZ"
 
     def _accumulate_decoded_tile(self, vae, samples, y0, x0, th, tw,
-                                 result_state, region_mask, device):
+                                 result_state, region_mask, device,
+                                 latent_downscale):
         image = vae.decode(samples[:, :, y0:y0+th, x0:x0+tw]).to(device)
         B, ih, iw, C = image.shape
-        iy0 = y0 * self.LATENT_DOWNSCALE
-        ix0 = x0 * self.LATENT_DOWNSCALE
+        if th > 0 and tw > 0:
+            tile_scale_h = max(1, int(round(float(ih) / float(th))))
+            tile_scale_w = max(1, int(round(float(iw) / float(tw))))
+            if tile_scale_h == tile_scale_w:
+                latent_downscale = tile_scale_h
+        iy0 = y0 * latent_downscale
+        ix0 = x0 * latent_downscale
 
         result, weight_map = result_state
         if result is None:
-            full_h = samples.shape[2] * self.LATENT_DOWNSCALE
-            full_w = samples.shape[3] * self.LATENT_DOWNSCALE
+            full_h = samples.shape[2] * latent_downscale
+            full_w = samples.shape[3] * latent_downscale
             result = torch.zeros((B, full_h, full_w, C), device=device)
             weight_map = torch.zeros((B, full_h, full_w, 1), device=device)
 
@@ -1016,15 +1101,19 @@ class SZ_KleinFaceRegionVAEDecode(SZ_KleinRegionPlanner):
         device = comfy.model_management.get_torch_device()
         latent = samples["samples"].to(device)
         B, C, H, W = latent.shape
+        latent_downscale = self._infer_latent_downscale_from_mask(
+            face_mask, H, W, self._infer_latent_downscale_from_latent(samples)
+        )
 
         face_mask_up = self._prepare_face_mask(face_mask, H, W, B, device)
         face_mask_soft = self._soften_face_mask(
-            face_mask_up, face_mask_grow, face_mask_blur, face_mask_threshold
+            face_mask_up, face_mask_grow, face_mask_blur, face_mask_threshold,
+            latent_downscale
         )
         tile_plan = self._plan_face_aware_tiles_from_mask(
             face_mask_up,
-            H * self.LATENT_DOWNSCALE,
-            W * self.LATENT_DOWNSCALE,
+            H * latent_downscale,
+            W * latent_downscale,
             tile_size,
             tile_size,
             overlap,
@@ -1034,6 +1123,7 @@ class SZ_KleinFaceRegionVAEDecode(SZ_KleinRegionPlanner):
             face_padding,
             face_mask_threshold,
             mask_space="latent",
+            latent_downscale=latent_downscale,
         )
         background_tiles = [
             tile["latent_rect"] for tile in tile_plan if tile["kind"] == "background"
@@ -1052,14 +1142,16 @@ class SZ_KleinFaceRegionVAEDecode(SZ_KleinRegionPlanner):
         done = 0
         for y0, x0, th, tw in background_tiles:
             result_state = self._accumulate_decoded_tile(
-                vae, latent, y0, x0, th, tw, result_state, non_face_mask, device
+                vae, latent, y0, x0, th, tw, result_state, non_face_mask, device,
+                latent_downscale
             )
             done += 1
             pbar.update_absolute(done, total_tiles, None)
 
         for y0, x0, th, tw in face_tiles:
             result_state = self._accumulate_decoded_tile(
-                vae, latent, y0, x0, th, tw, result_state, face_mask_soft, device
+                vae, latent, y0, x0, th, tw, result_state, face_mask_soft, device,
+                latent_downscale
             )
             done += 1
             pbar.update_absolute(done, total_tiles, None)

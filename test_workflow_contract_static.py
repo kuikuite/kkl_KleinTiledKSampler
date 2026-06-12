@@ -8,6 +8,10 @@ class WorkflowContractStaticTest(unittest.TestCase):
         path = Path(__file__).with_name("Klein-高清放大-SZ分块采样器.json")
         self.workflow = json.loads(path.read_text(encoding="utf-8"))
 
+    def load_dynamic_workflow(self):
+        path = Path(__file__).with_name("Klein-高清放大-SZ动态人脸mask分块工作流.json")
+        return json.loads(path.read_text(encoding="utf-8"))
+
     def test_workflow_uses_face_region_vae_nodes(self):
         node_types = {node["type"] for node in self.workflow["nodes"]}
 
@@ -75,6 +79,25 @@ class WorkflowContractStaticTest(unittest.TestCase):
             }:
                 input_names = [item["name"] for item in node["inputs"]]
                 self.assertIn("face_mask", input_names)
+
+    def test_dynamic_workflow_connects_external_face_mask_to_sz_nodes(self):
+        workflow = self.load_dynamic_workflow()
+        link_ids = {link[0] for link in workflow["links"]}
+
+        for link_id in (1811, 1812, 1813, 1814, 1815, 1816, 1817):
+            self.assertIn(link_id, link_ids)
+
+        target_links = {
+            (700, "face_mask"): 1813,
+            (703, "face_mask"): 1814,
+            (699, "face_mask"): 1815,
+            (702, "face_mask"): 1816,
+            (707, "face_mask"): 1817,
+        }
+        for (node_id, input_name), expected_link in target_links.items():
+            node = next(item for item in workflow["nodes"] if item["id"] == node_id)
+            actual_link = next(item for item in node["inputs"] if item["name"] == input_name)["link"]
+            self.assertEqual(actual_link, expected_link)
 
 
 if __name__ == "__main__":

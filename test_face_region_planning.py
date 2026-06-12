@@ -147,6 +147,84 @@ class FaceRegionPlanningTest(unittest.TestCase):
         self.assertEqual(len(plan), 2)
         self.assertTrue(all(tile["kind"] == "background" for tile in plan))
 
+    def test_plan_uses_supplied_latent_downscale_for_latent_rects(self):
+        plan = self.sampler._plan_face_aware_tiles_from_bbox(
+            bbox=None,
+            image_h=1024,
+            image_w=2048,
+            tile_h=2048,
+            tile_w=2048,
+            overlap=128,
+            face_tile_h=768,
+            face_tile_w=768,
+            face_overlap=192,
+            face_padding=1.35,
+            latent_downscale=16,
+        )
+
+        self.assertEqual(plan[0]["image_rect"], (0, 0, 1024, 2048))
+        self.assertEqual(plan[0]["latent_rect"], (0, 0, 64, 128))
+
+    def test_decoded_tile_accumulation_uses_actual_vae_decode_scale(self):
+        class FakeTensor:
+            def __init__(self, shape):
+                self.shape = shape
+
+            def __getitem__(self, key):
+                return self
+
+            def __setitem__(self, key, value):
+                return None
+
+            def __iadd__(self, other):
+                return self
+
+            def __mul__(self, other):
+                return self
+
+            def movedim(self, source, destination):
+                return self
+
+        class FakeImage(FakeTensor):
+            def to(self, device=None):
+                return self
+
+        class FakeVAE:
+            def decode(self, samples):
+                return FakeImage((1, 1024, 2048, 3))
+
+        torch = sys.modules["torch"]
+        original_zeros = getattr(torch, "zeros", None)
+        torch.zeros = lambda shape, device=None: FakeTensor(shape)
+        original_make_image_weight_mask = self.module.SZ_KleinFaceRegionVAEDecode._make_image_weight_mask
+        self.module.SZ_KleinFaceRegionVAEDecode._make_image_weight_mask = (
+            lambda self, h, w, device: FakeTensor((1, h, w, 1))
+        )
+        try:
+            result, weight_map = self.module.SZ_KleinFaceRegionVAEDecode()._accumulate_decoded_tile(
+                FakeVAE(),
+                FakeTensor((1, 16, 64, 128)),
+                0,
+                0,
+                64,
+                128,
+                (None, None),
+                None,
+                "cpu",
+                8,
+            )
+        finally:
+            if original_zeros is None:
+                delattr(torch, "zeros")
+            else:
+                torch.zeros = original_zeros
+            self.module.SZ_KleinFaceRegionVAEDecode._make_image_weight_mask = (
+                original_make_image_weight_mask
+            )
+
+        self.assertEqual(result.shape, (1, 1024, 2048, 3))
+        self.assertEqual(weight_map.shape, (1, 1024, 2048, 1))
+
 
 if __name__ == "__main__":
     unittest.main()
