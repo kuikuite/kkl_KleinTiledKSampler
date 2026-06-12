@@ -128,6 +128,18 @@ class NodeContractStaticTest(unittest.TestCase):
         self.assertIn("background_tiles", decode_source)
         self.assertIn("face_tiles", decode_source)
 
+    def test_background_tiles_are_not_masked_out_inside_face_bbox(self):
+        sampler_source = inspect.getsource(self.module.SZ_KleinTiledKSampler.sample)
+        encode_source = inspect.getsource(self.module.SZ_KleinFaceRegionVAEEncode.encode)
+        decode_source = inspect.getsource(self.module.SZ_KleinFaceRegionVAEDecode.decode)
+
+        self.assertIn("background_region_mask = None", sampler_source)
+        self.assertIn("background_region_mask = None", encode_source)
+        self.assertIn("background_region_mask = None", decode_source)
+        self.assertNotIn("non_face_mask = (1.0 - face_mask_soft)", sampler_source)
+        self.assertNotIn("non_face_mask = (1.0 - face_mask_soft)", encode_source)
+        self.assertNotIn("non_face_mask = (1.0 - face_mask_soft)", decode_source)
+
 
 if __name__ == "__main__":
     unittest.main()

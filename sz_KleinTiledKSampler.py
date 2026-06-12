@@ -852,14 +852,12 @@ class SZ_KleinTiledKSampler(SZ_KleinRegionPlanner):
         total_tiles = len(background_positions) + len(face_positions)
         outer_pbar = comfy.utils.ProgressBar(total_tiles)
 
-        non_face_mask = None
-        if face_positions and face_mask_soft is not None:
-            non_face_mask = (1.0 - face_mask_soft).clamp(0.0, 1.0)
+        background_region_mask = None
 
         self._process_and_accumulate_tiles(
             model, positive, negative, samples,
             global_noise, blend_up, background_positions,
-            result, weight_map, non_face_mask,
+            result, weight_map, background_region_mask,
             B, blend_strength,
             steps, cfg, sampler_name, scheduler, denoise, seed,
             previewer, device, outer_pbar, total_tiles, 0
@@ -991,16 +989,14 @@ class SZ_KleinFaceRegionVAEEncode(SZ_KleinRegionPlanner):
         ]
 
         result_state = (None, None)
-        non_face_mask = None
-        if face_tiles and face_mask_soft is not None:
-            non_face_mask = (1.0 - face_mask_soft).clamp(0.0, 1.0)
+        background_region_mask = None
 
         total_tiles = len(background_tiles) + len(face_tiles)
         pbar = comfy.utils.ProgressBar(total_tiles)
         done = 0
         for y0, x0, th, tw in background_tiles:
             result_state = self._accumulate_encoded_tile(
-                vae, pixels, y0, x0, th, tw, result_state, non_face_mask, device,
+                vae, pixels, y0, x0, th, tw, result_state, background_region_mask, device,
                 latent_downscale
             )
             done += 1
@@ -1133,16 +1129,14 @@ class SZ_KleinFaceRegionVAEDecode(SZ_KleinRegionPlanner):
         ]
 
         result_state = (None, None)
-        non_face_mask = None
-        if face_tiles and face_mask_soft is not None:
-            non_face_mask = (1.0 - face_mask_soft).clamp(0.0, 1.0)
+        background_region_mask = None
 
         total_tiles = len(background_tiles) + len(face_tiles)
         pbar = comfy.utils.ProgressBar(total_tiles)
         done = 0
         for y0, x0, th, tw in background_tiles:
             result_state = self._accumulate_decoded_tile(
-                vae, latent, y0, x0, th, tw, result_state, non_face_mask, device,
+                vae, latent, y0, x0, th, tw, result_state, background_region_mask, device,
                 latent_downscale
             )
             done += 1
