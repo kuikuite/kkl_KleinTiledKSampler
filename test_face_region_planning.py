@@ -84,7 +84,7 @@ class FaceRegionPlanningTest(unittest.TestCase):
         self.assertTrue(tiles)
         self.assertTrue(all(h <= 256 and w <= 256 for y, x, h, w in tiles))
 
-    def test_face_plan_decomposes_background_into_few_large_regions(self):
+    def test_face_plan_uses_full_background_underlay_plus_face_overlay(self):
         plan = self.sampler._plan_face_aware_tiles_from_bbox(
             bbox=(320, 704, 448, 832),
             image_h=1024,
@@ -102,13 +102,34 @@ class FaceRegionPlanningTest(unittest.TestCase):
         background_tiles = [tile for tile in plan if tile["kind"] == "background"]
 
         self.assertTrue(face_tiles)
-        self.assertEqual(len(background_tiles), 8)
+        self.assertEqual(len(background_tiles), 9)
+        self.assertTrue(all(tile["source_region"] == "full" for tile in background_tiles))
         self.assertTrue(all(tile["image_rect"][0] % 16 == 0 for tile in plan))
         self.assertTrue(all(tile["image_rect"][1] % 16 == 0 for tile in plan))
-        self.assertTrue(any(tile["source_region"] == "top" for tile in background_tiles))
-        self.assertTrue(any(tile["source_region"] == "bottom" for tile in background_tiles))
-        self.assertTrue(any(tile["source_region"] == "left" for tile in background_tiles))
-        self.assertTrue(any(tile["source_region"] == "right" for tile in background_tiles))
+        covered_columns = sorted({tile["image_rect"][1] for tile in background_tiles})
+        covered_rows = sorted({tile["image_rect"][0] for tile in background_tiles})
+        self.assertEqual(covered_columns, [0, 384, 768])
+        self.assertEqual(covered_rows, [0, 384, 512])
+
+    def test_face_plan_keeps_full_background_underlay_to_avoid_mask_holes(self):
+        plan = self.sampler._plan_face_aware_tiles_from_bbox(
+            bbox=(320, 704, 448, 832),
+            image_h=1024,
+            image_w=1280,
+            tile_h=2048,
+            tile_w=2048,
+            overlap=128,
+            face_tile_h=384,
+            face_tile_w=384,
+            face_overlap=192,
+            face_padding=1.0,
+            latent_downscale=16,
+        )
+
+        background_tiles = [tile for tile in plan if tile["kind"] == "background"]
+        self.assertEqual(len(background_tiles), 1)
+        self.assertEqual(background_tiles[0]["image_rect"], (0, 0, 1024, 1280))
+        self.assertEqual(background_tiles[0]["latent_rect"], (0, 0, 64, 80))
 
     def test_background_band_that_fits_tile_stays_single_tile(self):
         plan = self.sampler._split_background_around_face_region(

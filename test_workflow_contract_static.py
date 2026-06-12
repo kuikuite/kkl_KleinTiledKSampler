@@ -99,6 +99,17 @@ class WorkflowContractStaticTest(unittest.TestCase):
             actual_link = next(item for item in node["inputs"] if item["name"] == input_name)["link"]
             self.assertEqual(actual_link, expected_link)
 
+    def test_dynamic_workflow_defaults_soften_holey_face_masks(self):
+        workflow = self.load_dynamic_workflow()
+        for node in workflow["nodes"]:
+            values = node.get("widgets_values", [])
+            if node["type"] in {"SZ_KleinFaceRegionVAEEncode", "SZ_KleinFaceRegionVAEDecode"}:
+                self.assertEqual(values[6], 64)
+                self.assertEqual(values[7], 64)
+            elif node["type"] == "SZ_KleinTiledKSampler":
+                self.assertEqual(values[15], 64)
+                self.assertEqual(values[16], 64)
+
 
 if __name__ == "__main__":
     unittest.main()

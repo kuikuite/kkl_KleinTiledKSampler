@@ -18,11 +18,11 @@ mask is connected, it splits work into non-face and face regions:
 
 The VAE encode node, sampler, and VAE decode node now share one dynamic tile
 plan. A valid mask creates one padded, 16-aligned face bbox region first. The
-remaining image is split around that region into top, bottom, left, and right
-background rectangles, and each rectangle is tiled with the fewest blocks that
-fit the requested tile size and overlap. This keeps VAE and sampler boundaries
-aligned while avoiding a full-image background grid when only a few large
-non-face blocks are needed.
+background pass then lays down a full-image underlay using the fewest regular
+tiles for the requested background tile size and overlap. Face tiles are blended
+on top through the softened face mask. This keeps VAE and sampler boundaries
+aligned and prevents black holes when the incoming mask is hollow or only marks
+hair/outline instead of the full face rectangle.
 
 ## Klein Size Rules
 
@@ -39,6 +39,7 @@ Recommended defaults:
 - Face tile: `768 x 768`, overlap `192`
 - Face padding: `1.35`
 - Mask threshold: `0.2`
+- Mask grow / blur: `64 / 64`
 
 ## Face Mask
 

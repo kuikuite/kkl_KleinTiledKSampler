@@ -110,6 +110,15 @@ class NodeContractStaticTest(unittest.TestCase):
         self.assertIn("face_mask", encode_optional)
         self.assertIn("face_mask", decode_optional)
 
+    def test_face_mask_defaults_are_soft_enough_for_holey_person_masks(self):
+        sampler_required = self.module.SZ_KleinTiledKSampler.INPUT_TYPES()["required"]
+        encode_required = self.module.SZ_KleinFaceRegionVAEEncode.INPUT_TYPES()["required"]
+        decode_required = self.module.SZ_KleinFaceRegionVAEDecode.INPUT_TYPES()["required"]
+
+        for required in (sampler_required, encode_required, decode_required):
+            self.assertEqual(required["face_mask_grow"][1]["default"], 64)
+            self.assertEqual(required["face_mask_blur"][1]["default"], 64)
+
     def test_sampler_uses_shared_face_aware_tile_plan(self):
         source = inspect.getsource(self.module.SZ_KleinTiledKSampler.sample)
 

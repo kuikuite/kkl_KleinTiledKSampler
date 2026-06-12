@@ -308,9 +308,8 @@ class SZ_KleinRegionPlanner:
                 image_h, image_w, tile_h, tile_w, overlap, latent_downscale
             )
 
-        background_tiles = self._split_background_around_face_region(
-            face_region, image_h, image_w, tile_h, tile_w, overlap,
-            latent_downscale
+        background_tiles = self._regular_tile_plan(
+            image_h, image_w, tile_h, tile_w, overlap, latent_downscale
         )
         y0, y1, x0, x1 = face_region
         face_tiles = [
@@ -539,10 +538,10 @@ class SZ_KleinTiledKSampler(SZ_KleinRegionPlanner):
                     "default": 0.2, "min": 0.0, "max": 1.0, "step": 0.01
                 }),
                 "face_mask_grow": ("INT", {
-                    "default": 0, "min": 0, "max": 256, "step": 16
+                    "default": 64, "min": 0, "max": 256, "step": 16
                 }),
                 "face_mask_blur": ("INT", {
-                    "default": 24, "min": 0, "max": 256, "step": 16
+                    "default": 64, "min": 0, "max": 256, "step": 16
                 }),
                 "blend_strength": ("FLOAT", {
                     "default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05
@@ -908,10 +907,10 @@ class SZ_KleinFaceRegionVAEEncode(SZ_KleinRegionPlanner):
                     "default": 0.2, "min": 0.0, "max": 1.0, "step": 0.01
                 }),
                 "face_mask_grow": ("INT", {
-                    "default": 0, "min": 0, "max": 256, "step": 16
+                    "default": 64, "min": 0, "max": 256, "step": 16
                 }),
                 "face_mask_blur": ("INT", {
-                    "default": 24, "min": 0, "max": 256, "step": 16
+                    "default": 64, "min": 0, "max": 256, "step": 16
                 }),
             },
             "optional": {
@@ -1044,10 +1043,10 @@ class SZ_KleinFaceRegionVAEDecode(SZ_KleinRegionPlanner):
                     "default": 0.2, "min": 0.0, "max": 1.0, "step": 0.01
                 }),
                 "face_mask_grow": ("INT", {
-                    "default": 0, "min": 0, "max": 256, "step": 16
+                    "default": 64, "min": 0, "max": 256, "step": 16
                 }),
                 "face_mask_blur": ("INT", {
-                    "default": 24, "min": 0, "max": 256, "step": 16
+                    "default": 64, "min": 0, "max": 256, "step": 16
                 }),
             },
             "optional": {
